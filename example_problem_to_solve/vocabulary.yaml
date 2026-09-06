@@ -1,0 +1,259 @@
+# ============================================================
+# vocabulary.yaml
+#
+# The verification-level counterpart to module/contracts/schema.yaml. Where
+# schema.yaml documents the BT.cpp-facing surface of basic_action_theory.pl
+# (do_node/4 actions, holds/2 conditions -- what a TREE LEAF can be),
+# this file documents the OUTER-QUERY-facing surface (fluents and
+# derived predicates over a whole SITUATION) -- what a
+# the problem's own goal_formula.pl file is allowed to be WRITTEN
+# IN TERMS OF. Same relationship as schema.yaml has to bt_to_prolog.py:
+# module/contracts/goal_formula_check.py reads this file to validate
+# goal_formula.pl BEFORE it's ever consulted/queried, exactly the same
+# "structural validation is a hard failure, not a warning" posture
+# bt_to_prolog.py already takes for behavior_tree.xml against
+# schema.yaml.
+#
+# WHAT "situation_arg" MEANS: the 1-based position, among this
+# predicate's own arguments, that carries the SITUATION term (a
+# do(Action,S) chain, or s0) -- needed so goal_formula_check.py can
+# verify a goal formula is UNIFORM (Reiter's own sense, "Knowledge in
+# Action": the SAME single situation term used in every situation
+# slot across the whole formula, never two different ones). It is
+# still declared PER-PREDICATE, not assumed to be a fixed position,
+# even though every predicate below now puts S LAST per Reiter's own
+# convention, no exceptions -- now/2 used to be the one holdout
+# (now(S,T), keeping S first, since it's called from ~15 places
+# throughout basic_action_theory.pl rather than just its own
+# definition); that's now fixed too, now(T,S).
+# `situation_arg: null` means this predicate has NO situation argument
+# at all -- a plain, situation-independent fact (start/2)
+# that's still fine to reference inside a goal formula (e.g. to bind a
+# coordinate), since it doesn't introduce a second situation term.
+#
+# WHAT ISN'T HERE, ON PURPOSE: internal plumbing predicates
+# (current_walk/5, final_situation/1, now/2's own use as a generator,
+# plan/1, do_node/4, walk_duration/2, ...) are deliberately NOT part
+# of this vocabulary -- they exist to IMPLEMENT the fluents below, not
+# to be referenced directly from a goal formula. now/2 IS included
+# below, in its role of reading off a bound situation's own current
+# TIME (not generating/enumerating situations), for formulas that want
+# to pair a fluent's value with a specific instant, e.g.
+# "now(T,S), battery(B,T,S), B > 50".
+#
+# CURRENT LIMITATION: goal_formula_check.py validates exactly ONE
+# goal_formula/1 clause; it does not yet support goal_formula.pl
+# defining its own local helper predicates (those would need the
+# checker extended to recognize and exempt them from this whitelist).
+# ============================================================
+
+vocabulary_version: 1
+
+predicates:
+
+  # ----------------------------------------------------------------
+  # Multi-waypoint / history-search fluents.
+  # ----------------------------------------------------------------
+  - name: visited
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: Loc, type: point(X,Y), description: "A waypoint, written point(X,Y) with literal numbers."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: >
+      TRUE iff the robot ACTUALLY ARRIVED (Status=true -- landed
+      within goal_tolerance of that leg's own endpoint, not merely
+      Reason=completed) at Loc, the endpoint of SOME already-completed
+      MoveTo leg, anywhere in S's history. Monotonic: once true for a
+      situation, true for every situation built on top of it (a
+      collision or battery depletion earlier in the SAME resolved
+      world can instead make it FALSE by never reaching that far --
+      see basic_action_theory.pl's own note on why this needs to be a
+      genuine per-world probabilistic check, not a static plan-
+      structure one). NOTE: for a plain linear Sequence of legs (no
+      Fallback in between), checking only the LAST waypoint already
+      logically entails every earlier one was visited too.
+
+  - name: halted_with
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: Reason, type: term, description: "A haltMoveto Reason term, e.g. completed, crashed(_), battery_under(20)."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: >
+      TRUE iff a haltMoveto occurred ANYWHERE in S's history with
+      exactly this Reason (searches the WHOLE history, not just the
+      most recent halt). The general-purpose primitive every *_in(S)/
+      *_obstacle(S,...)/*_threshold(S,...) predicate below is built
+      from -- reach for those first (they read more directly), use
+      halted_with/2 itself for a Reason not already covered by one.
+
+  # ----------------------------------------------------------------
+  # "Did this specific halting cause ever fire" -- one per Reason,
+  # all built directly on halted_with/2 above. The *_in(S) family
+  # wildcards any extra Reason arguments (obstacle id, threshold);
+  # the *_obstacle/*_threshold family exposes them, bound.
+  # ----------------------------------------------------------------
+  - name: crashed_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff the robot ever crashed into ANY obstacle anywhere in S's history."
+
+  - name: battery_depleted_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff the battery ever ran out (0%) anywhere in S's history."
+
+  - name: obstacle_in_bound_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff an obstacle_in_bound(Threshold) trigger ever fired (ANY threshold) anywhere in S's history."
+
+  - name: obstacle_on_path_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff an obstacle_on_path(Threshold) trigger ever fired (ANY threshold) anywhere in S's history."
+
+  - name: battery_under_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff a battery_below(Threshold) trigger ever fired (ANY threshold) anywhere in S's history."
+
+  - name: battery_equal_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff a battery_equal(Threshold) trigger ever fired (ANY threshold) anywhere in S's history."
+
+  - name: battery_over_in
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff a battery_over(Threshold) trigger ever fired (ANY threshold) anywhere in S's history."
+
+  - name: crashed_obstacle
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: ObstacleId, type: atom, description: "WHICH obstacle_polygon/2 Id was crashed into -- bound, not wildcarded."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: "Like crashed_in/1, but exposes WHICH obstacle. Fails (no solution) if S didn't halt on a crash."
+
+  - name: obstacle_in_bound_obstacle
+    arity: 3
+    situation_arg: 3
+    args:
+      - {position: 1, name: Threshold, type: float, description: "WHICH threshold value triggered -- bound, not wildcarded."}
+      - {position: 2, name: ObstacleId, type: atom, description: "WHICH obstacle -- bound, not wildcarded."}
+      - {position: 3, name: S, type: situation, description: "The situation to check at."}
+    description: "Like obstacle_in_bound_in/1, but exposes WHICH threshold/obstacle. Fails if S didn't halt for this trigger."
+
+  - name: obstacle_on_path_obstacle
+    arity: 3
+    situation_arg: 3
+    args:
+      - {position: 1, name: Threshold, type: float, description: "WHICH threshold value triggered -- bound, not wildcarded."}
+      - {position: 2, name: ObstacleId, type: atom, description: "WHICH obstacle -- bound, not wildcarded."}
+      - {position: 3, name: S, type: situation, description: "The situation to check at."}
+    description: "Like obstacle_on_path_in/1, but exposes WHICH threshold/obstacle. Fails if S didn't halt for this trigger."
+
+  - name: battery_under_threshold
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: Threshold, type: float, description: "WHICH threshold value triggered -- bound, not wildcarded."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: "Like battery_under_in/1, but exposes WHICH threshold. Fails if S didn't halt for this trigger."
+
+  - name: battery_equal_threshold
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: Threshold, type: float, description: "WHICH threshold value triggered -- bound, not wildcarded."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: "Like battery_equal_in/1, but exposes WHICH threshold. Fails if S didn't halt for this trigger."
+
+  - name: battery_over_threshold
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: Threshold, type: float, description: "WHICH threshold value triggered -- bound, not wildcarded."}
+      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+    description: "Like battery_over_in/1, but exposes WHICH threshold. Fails if S didn't halt for this trigger."
+
+  # ----------------------------------------------------------------
+  # Point-in-time fluents -- take an explicit TIME argument as well
+  # as a situation; pair with now/2 below to ask about "right now" in
+  # S, or with a literal T for a specific instant.
+  # ----------------------------------------------------------------
+  - name: at
+    arity: 4
+    situation_arg: 4
+    args:
+      - {position: 1, name: X, type: float, description: "World-frame X coordinate at time T (output if unbound)."}
+      - {position: 2, name: Y, type: float, description: "World-frame Y coordinate at time T (output if unbound)."}
+      - {position: 3, name: T, type: float, description: "The time to evaluate position at -- NOT a situation, a real clock-time value."}
+      - {position: 4, name: S, type: situation, description: "The situation to check at."}
+    description: >
+      Position of the robot at real clock-time T in situation S.
+      Already folds in both noise draws (Z, Zt) for whichever walk was
+      in progress at T. T is free -- typically bound via now(T,S) to
+      mean "right now", or left as a literal for a specific instant.
+
+  - name: battery
+    arity: 3
+    situation_arg: 3
+    args:
+      - {position: 1, name: Level, type: float, description: "Battery percentage (0-100) at time T (output if unbound)."}
+      - {position: 2, name: T, type: float, description: "The time to evaluate battery level at -- NOT a situation."}
+      - {position: 3, name: S, type: situation, description: "The situation to check at."}
+    description: "Battery charge level at real clock-time T in situation S."
+
+  - name: now
+    arity: 2
+    situation_arg: 2
+    args:
+      - {position: 1, name: T, type: float, description: "S's own current clock-time (output if unbound)."}
+      - {position: 2, name: S, type: situation, description: "The situation to read the current time of."}
+    description: >
+      T is the real clock-time S itself represents "right now" --
+      pair with at/4 or battery/3 to ask about the CURRENT position/
+      battery level in S, e.g. "now(T,S), at(X,Y,T,S), ...".
+
+  - name: moving
+    arity: 1
+    situation_arg: 1
+    args:
+      - {position: 1, name: S, type: situation, description: "The situation to check at."}
+    description: "TRUE iff a walk is still in progress in S (a startMoveto has happened with no matching haltMoveto/interrupt yet)."
+
+  # ----------------------------------------------------------------
+  # Plain, situation-INDEPENDENT facts -- safe to reference inside a
+  # goal formula (to bind a coordinate, say) without affecting
+  # uniformity, since they carry no situation argument at all.
+  # ----------------------------------------------------------------
+  - name: start
+    arity: 2
+    situation_arg: null
+    args:
+      - {position: 1, name: SX, type: float, description: "The robot's own starting X coordinate."}
+      - {position: 2, name: SY, type: float, description: "The robot's own starting Y coordinate."}
+    description: >
+      The start/2 fact -- the robot's position at s0. Sourced from
+      config.yaml's initial_situation.start_x/start_y, generated into
+      config_generated.pl. There is no global goal/2 fact any more --
+      goal information lives only in this file (goal_formula.pl); a
+      formula that needs a specific coordinate should use the literal
+      value, or the goal point named in a planWith(...) leg.

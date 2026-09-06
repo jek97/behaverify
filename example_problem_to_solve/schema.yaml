@@ -1,0 +1,583 @@
+# ============================================================
+# schema.yaml
+#
+# Node model for the BehaviorTree.cpp library, describing every
+# ACTION and CONDITION currently encoded in basic_action_theory.pl's
+# do_node/4 / holds/2 clauses. This is the YAML analogue of what
+# BT.cpp's own <TreeNodesModel> XML section captures (ID, port
+# direction, port type) -- one entry per node here corresponds to
+# one <Action ID="..."> / <Condition ID="..."> entry there, and this
+# file is written so a mechanical XML generator could produce a
+# valid TreeNodesModel from it later without redesigning anything.
+#
+# NOT included here, and why:
+#   - Sequence / Fallback: these map DIRECTLY to BT.cpp's own
+#     BUILT-IN control nodes (<Sequence>, <Fallback>) -- exactly
+#     seq_node/1 and fallback_node/1 in basic_action_theory.pl. BT.cpp
+#     doesn't require (or allow) declaring built-in node types in a
+#     TreeNodesModel, so there is nothing to add here for them.
+#   - and(P,Q) / or(P,Q): NOT modeled as condition nodes. BT.cpp's
+#     own idiom achieves conjunction via a Sequence of conditions and
+#     disjunction via a Fallback of conditions -- i.e. the SAME
+#     structural composition already used for actions, rather than a
+#     dedicated logical-AND/OR leaf. Modeling and/or as their own
+#     condition nodes would fight that idiom rather than use it.
+#   - neg(P): NOT modeled as a condition node either -- BT.cpp has a
+#     built-in <Inverter> DECORATOR for exactly this (wrap any single
+#     child, invert its result), which is the idiomatic way to negate
+#     a condition in a BT.cpp tree, rather than a separate negated
+#     leaf per condition.
+#
+# Implementations matching this schema live in bt_actions.py -- see
+# that file's own header for how each entry below corresponds to a
+# concrete Python callable (or, for MoveTo, an interface/spec rather
+# than an executable stand-in -- explained there).
+#
+# An actual BT.cpp XML tree validated/translated against this schema
+# lives at the problem's own behavior_tree.xml (problems/<name>/behavior_tree.xml) -- see
+# module/translators/bt_to_prolog.py for the concrete XML attribute
+# encoding this project uses for each port TYPE below (Point as
+# "X;Y", std::vector<std::string> as ";"-separated, and the
+# {blackboard_key} convention every BT.cpp port already uses for
+# ports that are wired to another node rather than given a literal
+# value -- this schema only describes port TYPES/directions, not a
+# serialization, so it stays agnostic of that choice).
+# ============================================================
+
+schema_version: 1
+bt_cpp_target_format: 4    # BTCPP_format="4" -- the XML attribute a
+                            # generated TreeNodesModel should carry
+
+actions:
+
+  # ----------------------------------------------------------------
+  # MoveTo -- corresponds to moveto_leg(ControlPoints,Triggers) in
+  # basic_action_theory.pl, i.e. one startMoveto/haltMoveto pair run to
+  # its halt.
+  # ----------------------------------------------------------------
+  - id: MoveTo
+    prolog_action: moveto_leg
+    description: >
+      Runs one durative moveto leg along ControlPoints, halting on
+      whichever of Triggers occurs earliest (or on natural
+      completion if none do). Reason/Status are haltMoveto's own two
+      outputs -- see basic_action_theory.pl's own header comment on why
+      they are kept distinct (Reason=completed only means the walk
+      wasn't cut short; Status additionally requires landing within
+      goal_tolerance of THIS LEG'S OWN endpoint).
+    ports:
+      - name: control_points
+        direction: input
+        type: std::vector<Point>
+        required: true
+        description: >
+          Chained cubic Bezier control points, length 3k+1. Typically
+          bound by a preceding PlanAstar/PlanStraight node sharing
+          the same port/blackboard entry -- see
+          basic_action_theory.pl's own note on the "leave a variable
+          free, let a prior step bind it" pattern.
+      - name: triggers
+        direction: input
+        type: std::vector<std::string>
+        required: false
+        description: >
+          EXTRA halting conditions this leg reacts to, beyond what's
+          automatic (see below) -- OPTIONAL, may be omitted or empty.
+          Two things are no longer written here at all, since
+          module/translators/bt_to_prolog.py now adds them to every
+          MoveTo automatically: collision (fixed threshold, the
+          robot's own safety margin) and battery (fixed threshold,
+          exactly 0% -- only added when this problem's own config.yaml
+          has battery.enabled: true). ALSO automatic: a STRUCTURAL
+          guard for every Condition left sibling of this MoveTo's own
+          branch under an enclosing <ReactiveSequence>/
+          <ReactiveFallback> ancestor (optionally wrapped in
+          <Inverter>) -- e.g. a <BatteryOver threshold="70"/> left
+          sibling under a <ReactiveSequence> automatically makes this
+          leg halt the moment battery drops to 70%, with NO triggers=
+          entry needed for it (see bt_to_prolog.py's own module
+          docstring, "CONTROL-FLOW GUARD DERIVATION", and
+          basic_action_theory.pl's guard_break(Cond,Code)/holds_leg/9
+          for the underlying generic mechanism). What's left to write
+          here explicitly is only a leg-INTRINSIC termination
+          condition that isn't derivable from tree structure at all --
+          e.g. a Bug-algorithm leg's own line_of_sight_clear/
+          crosses_segment stopping rule. Other valid entries (for that
+          purpose, or for backward compatibility with an older tree
+          that still spells out collision/battery here -- harmless,
+          just redundant): obstacle_in_bound(Threshold) (a GENERIC,
+          per-call obstacle-proximity trigger -- what "obstacle
+          sighted" was renamed to; fires on proximity to ANY
+          obstacle's boundary, whether or not the trajectory ever
+          actually enters it), obstacle_on_path(Threshold) (the SAME
+          per-call proximity idea, but restricted to obstacles the
+          trajectory ACTUALLY ENTERS somewhere along the walk -- a
+          genuinely different, stricter geometric test, not another
+          threshold for obstacle_in_bound; see
+          first_on_path_crossing_time's own note in
+          basic_action_theory.pl), battery_below(Threshold) /
+          battery_equal(Threshold) / battery_over(Threshold) (the same
+          per-call idea for battery level, at <, =, and > respectively
+          -- all THREE are SEPARATE, additional triggers from the
+          fixed battery=0% one, not replacements for it; battery_over
+          currently only ever fires immediately or never, since
+          battery never rises within a walk today, but is structured
+          for a genuine future-crossing search once recharging is
+          modeled -- see first_battery_over_time's own note in
+          basic_action_theory.pl), line_of_sight_clear(ObstacleId,GX,GY)
+          / crosses_segment(SX,SY,GX,GY) (the Bug0/Bug2 boundary-LEAVE
+          triggers for a leg whose ControlPoints came from a preceding
+          FollowBoarder node -- fires respectively as soon as
+          ObstacleId stops occluding a straight line to (GX,GY), or
+          when the walk re-crosses segment (SX,SY)-(GX,GY) at a point
+          closer to (GX,GY) than (SX,SY) was; see collision_geometry.py's
+          "BUG-ALGORITHM BOUNDARY-LEAVE PRIMITIVES" section for the
+          full geometry) (see trigger_crossing_time/11 in
+          basic_action_theory.pl for the complete, current list -- a
+          future trigger added there needs no schema change beyond
+          documenting its name here). Written in a BT.cpp XML tree as
+          a semicolon-separated string, e.g.
+          triggers="obstacle_in_bound(0.6);battery_below(20)", or the
+          attribute omitted entirely if this leg needs nothing beyond
+          the automatic collision/battery/structural-guard triggers.
+      - name: reason
+        direction: output
+        type: std::string
+        description: >
+          One of: completed, battery_depleted, crashed(ObstacleId),
+          obstacle_in_bound(Threshold,ObstacleId),
+          obstacle_on_path(Threshold,ObstacleId), battery_under(Threshold),
+          battery_equal(Threshold), battery_over(Threshold), or any
+          other entry from triggers that actually fired.
+          crashed/obstacle_in_bound/obstacle_on_path carry WHICH
+          obstacle_polygon/2 Id they fired against (an argmin over
+          obstacles at the exact crossing point, computed by
+          collision_geometry.py), not just that one fired. Every
+          battery_* Reason above also carries the Threshold that was
+          crossed (echoing the trigger's own argument). Reason functors
+          deliberately differ from their trigger names ONLY where a
+          distinct word was actually requested -- battery_below's
+          Reason is battery_under (mirroring collision/crashed's own
+          asymmetry), while battery_equal/battery_over keep the SAME
+          functor as their trigger name.
+      - name: status
+        direction: output
+        type: bool
+        description: >
+          true iff reason=completed AND the final position landed
+          within goal_tolerance of this leg's own endpoint (the last
+          point of control_points, NOT necessarily the global goal --
+          see leg_target/3's own comment in basic_action_theory.pl).
+
+  # ----------------------------------------------------------------
+  # The two planners. Both are dispatched, underneath, through the
+  # SAME parametrized Prolog predicate -- planWith(Algorithm,CP) /
+  # plan_call/8 with Algorithm fixed per entry -- and the SAME
+  # underlying Python implementation in bt_actions.py, parametrized
+  # by algorithm. Modeled as two DISTINCT BT.cpp nodes here (rather
+  # than one generic node with an algorithm string port) because
+  # that's the more idiomatic, directly-draggable BT.cpp shape for a
+  # small, fixed set of concrete planners -- see bt_actions.py for
+  # the shared implementation underneath.
+  # ----------------------------------------------------------------
+  - id: PlanAstar
+    prolog_action: planWith
+    prolog_algorithm: astar
+    description: >
+      Black-box A* planner (planners.py's plan_astar/5) from
+      the CURRENT position (now/2 + at/4) to an EXPLICIT goal port
+      (NOT the global goal/2 fact -- this is what lets two planning
+      calls in the same tree target genuinely different destinations,
+      e.g. a "GoTo(target)" subtree instantiated twice with two
+      different port bindings for target).
+      Instantaneous -- does not advance simulated time or move the
+      robot; only computes ControlPoints for a SUBSEQUENT MoveTo to
+      use. Records a planned(astar,Reason) marker in the situation
+      history for traceability (see planned_with/3) -- it does NOT
+      gate on a precondition; a planner call is always attempted, its
+      Reason/Status simply report whether a path was found.
+    ports:
+      - name: goal
+        direction: input
+        type: Point
+        required: true
+        description: >
+          Target position for this planning call. Maps directly to
+          planWith's own point(GX,GY) argument in basic_action_theory.pl
+          -- per-call, not shared across other planning calls in the
+          same tree.
+      - name: control_points
+        direction: output
+        type: std::vector<Point>
+        description: >
+          The planned path, as chained cubic Bezier control points.
+          Empty if reason=no_path.
+      - name: reason
+        direction: output
+        type: std::string
+        description: "One of: completed, no_path."
+      - name: status
+        direction: output
+        type: bool
+        description: "true iff reason=completed."
+
+  - id: PlanStraight
+    prolog_action: planWith
+    prolog_algorithm: straight
+    description: >
+      Direct straight-line planner (planners.py's
+      plan_straight/5) -- no map lookup at all, a single degenerate
+      (collinear-control-point) Bezier segment from the current
+      position to an EXPLICIT goal port (NOT the global goal/2 fact --
+      see PlanAstar's own description for why). Same interface as
+      PlanAstar in every other respect (instantaneous, records a
+      planned(straight,Reason) marker, etc.).
+    ports:
+      - name: goal
+        direction: input
+        type: Point
+        required: true
+        description: >
+          Target position for this planning call -- see PlanAstar's
+          own goal port.
+      - name: control_points
+        direction: output
+        type: std::vector<Point>
+        description: >
+          The planned path (always 4 points, a single Bezier
+          segment). Empty if reason=no_path (only possible for
+          degenerate/non-finite input -- an ordinary straight line
+          between two finite points always exists).
+      - name: reason
+        direction: output
+        type: std::string
+        description: "One of: completed, no_path."
+      - name: status
+        direction: output
+        type: bool
+        description: "true iff reason=completed."
+
+  - id: PlanVoronoi
+    prolog_action: planWith
+    prolog_algorithm: voronoi
+    description: >
+      Generalized-Voronoi-diagram planner (planners.py's
+      plan_voronoi/5) -- SAME interface as PlanAstar/PlanStraight
+      above (bare Algorithm atom, no extra ports). Builds a roadmap
+      from scipy's Voronoi diagram of points sampled along every
+      obstacle's own boundary (a standard technique: such a diagram
+      approximates the true generalized Voronoi diagram / medial axis
+      of free space, since every edge is by construction maximally
+      clear of the obstacles that produced it), filters out any ridge
+      that crosses into an obstacle, then connects the CURRENT
+      position and goal to the closest POINT on the closest EDGE of
+      that roadmap (not just the closest vertex) and takes the
+      shortest path through it. Degrades to a straight line (never
+      fails) when there are no obstacles to route around at all; only
+      fails (reason=no_path) if a roadmap exists but start/goal are
+      genuinely disconnected within it. Same instantaneous/
+      traceability semantics as PlanAstar/PlanStraight otherwise
+      (records a planned(voronoi,Reason) marker, does not gate on a
+      precondition).
+    ports:
+      - name: goal
+        direction: input
+        type: Point
+        required: true
+        description: >
+          Target position for this planning call -- see PlanAstar's
+          own goal port.
+      - name: control_points
+        direction: output
+        type: std::vector<Point>
+        description: >
+          The planned path, as chained cubic Bezier control points,
+          routed along the free-space Voronoi roadmap. Empty if
+          reason=no_path.
+      - name: reason
+        direction: output
+        type: std::string
+        description: "One of: completed, no_path."
+      - name: status
+        direction: output
+        type: bool
+        description: "true iff reason=completed."
+
+  # ----------------------------------------------------------------
+  # A FOURTH planner -- boundary following, shared by EVERY Bug-
+  # algorithm variant, dispatched through the SAME planWith(Algorithm,
+  # Goal,CP)/plan_call/8 template as PlanAstar/PlanStraight above, just
+  # with a COMPOUND Algorithm term (follow_boarder(ObstacleId,Offset))
+  # instead of a bare atom -- see plan_call/8's own follow_boarder
+  # clauses in basic_action_theory.pl. UNLIKE an earlier version of this
+  # schema (which had separate FollowBoarder0/FollowBoarder1 actions,
+  # each with the stopping rule baked in), this planner does NOT decide
+  # when to leave the boundary at all -- it just plans a full clockwise
+  # loop, and WHICH bug variant a leg implements is entirely a matter
+  # of which trigger the SUBSEQUENT MoveTo node's own `triggers` port
+  # names: line_of_sight_clear(ObstacleId,GX,GY) for Bug0, crosses_
+  # segment(SX,SY,GX,GY) for Bug2 -- see MoveTo's own triggers port
+  # description below, and LineOfSightClear's entry further down for
+  # the condition-node form of the first one.
+  # ----------------------------------------------------------------
+  - id: FollowBoarder
+    prolog_action: planWith
+    description: >
+      Boundary-following planner (planners.py's follow_boarder/
+      5): from the CURRENT position (now/2 + at/4), traces a FULL
+      CLOCKWISE LOOP around obstacle_id's own obstacle_polygon/2
+      boundary, offset outward by `offset`. Deliberately has NO goal
+      port and NO stopping condition of its own -- see this action's
+      own header comment above. `offset` is typically unified with the
+      SAME Threshold as whichever obstacle_on_path(Threshold)/
+      obstacle_in_bound(Threshold) trigger/condition supplied
+      obstacle_id in the first place -- a small residual gap between
+      the robot's actual position and that nominal offset (from
+      bisection tolerance, not noise -- see first_on_path_crossing_
+      time's own note) is harmless, absorbed into the planner's own
+      first path segment. Same instantaneous/traceability semantics as
+      PlanAstar/PlanStraight otherwise (records a
+      planned(follow_boarder(ObstacleId,Offset),Reason) marker, does
+      not gate on a precondition).
+    ports:
+      - name: obstacle_id
+        direction: input
+        type: std::string
+        required: true
+        description: >
+          Which obstacle_polygon/2 Id to circle. Written VERBATIM as
+          Prolog text (a bare atom, e.g. obstacle_id="obs5"), same
+          convention as HaltedWith's own reason port below -- NOT
+          quoted. Typically the SAME ObstacleId a preceding trigger/
+          condition reported (e.g. obstacle_on_path(Threshold,
+          ObstacleId)'s second argument).
+      - name: offset
+        direction: input
+        type: double
+        required: true
+        description: >
+          Distance to maintain from the obstacle's own boundary edge
+          while circling it, metres -- same units/definition as
+          obstacle_in_bound/obstacle_on_path's own Threshold (raw
+          clearance to the polygon boundary; this planner does not
+          separately add robot radius/safety_buffer, so pass a
+          Threshold that already accounts for them if that's the
+          intent, same as every other Threshold in this schema).
+      - name: control_points
+        direction: output
+        type: std::vector<Point>
+        description: >
+          The boundary-following path, as chained cubic Bezier control
+          points -- a full clockwise loop starting and ending at the
+          current position's own nearest point on the offset boundary.
+          Empty if reason=no_path.
+      - name: reason
+        direction: output
+        type: std::string
+        description: "One of: completed, no_path (obstacle_id names no known obstacle)."
+      - name: status
+        direction: output
+        type: bool
+        description: "true iff reason=completed."
+
+conditions:
+
+  # ----------------------------------------------------------------
+  # holds(at_goal(GX,GY,Tol), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: AtGoal
+    prolog_condition: at_goal
+    description: >
+      True iff the CURRENT position (now/2 + at/4) is within
+      tolerance of an EXPLICIT point -- PARAMETRIZED, same as
+      ObstacleInBound/BatteryBelow/etc., not a lookup against any
+      global "the goal" fact (there is no such fact in this theory).
+      Typical use: the first child of a Fallback, to skip planning/
+      moving entirely if already there. Pass the SAME point as
+      whichever PlanAstar/PlanVoronoi/... node's own goal port
+      targets, if that's the intent.
+    ports:
+      - name: goal
+        direction: input
+        type: Point
+        required: true
+        description: >
+          The point to check proximity to -- see PlanAstar's own goal
+          port.
+      - name: tolerance
+        direction: input
+        type: double
+        required: true
+        description: Distance threshold, metres.
+
+  # ----------------------------------------------------------------
+  # holds(halted_with_cond(Reason), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: HaltedWith
+    prolog_condition: halted_with_cond
+    description: >
+      True iff SOMEWHERE in the situation history a haltMoveto
+      occurred with exactly this Reason (searches the WHOLE history,
+      not just the most recent halt -- see halted_with/2's own
+      comment). Lets a condition branch on how a PREVIOUS leg ended.
+    ports:
+      - name: reason
+        direction: input
+        type: std::string
+        required: true
+        description: >
+          One of: completed, battery_depleted, crashed(ObstacleId),
+          obstacle_in_bound(Threshold,ObstacleId),
+          battery_under(Threshold), or any other Reason from MoveTo's
+          own reason port above (same notes on crashed/obstacle_in_bound
+          carrying WHICH obstacle, and obstacle_in_bound/battery_under
+          also carrying WHICH threshold, apply here). Written exactly
+          as valid Prolog text, e.g. reason="crashed(_)" to match ANY
+          obstacle (a bare reason="crashed" no longer matches anything
+          -- a bare atom never unifies with a compound term of the
+          same name), reason="crashed(obs5)" for one specific
+          obstacle, or reason="battery_under(20)" for one specific
+          threshold.
+
+  # ----------------------------------------------------------------
+  # holds(obstacle_in_bound(Threshold), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: ObstacleInBound
+    prolog_condition: obstacle_in_bound
+    description: >
+      True iff the CURRENT position (now/2 + at/4) is within
+      Threshold of ANY obstacle -- a single-point check reusing the
+      exact same underlying geometry (collision_geometry.py's
+      within_obstacle_threshold/_min_clearance_all) as the
+      obstacle_in_bound(Threshold) TRIGGER, just evaluated once
+      instead of searched across a whole future trajectory. This is
+      what "obstacle sighted" was renamed to; there is no fixed global
+      threshold anymore -- every use, trigger or condition, supplies
+      its own.
+    ports:
+      - name: threshold
+        direction: input
+        type: double
+        required: true
+        description: Distance threshold, metres.
+
+  # ----------------------------------------------------------------
+  # holds(obstacle_on_path(Threshold), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: ObstacleOnPath
+    prolog_condition: obstacle_on_path
+    description: >
+      True iff the CURRENT position (now/2 + at/4) is within
+      Threshold of an obstacle THIS WALK'S OWN TRAJECTORY actually
+      enters (goes geometrically inside, not just near) somewhere
+      across its full span -- a genuinely stricter, different test
+      from ObstacleInBound above, not another threshold for it: a
+      trajectory can graze within ObstacleInBound's Threshold of an
+      obstacle's boundary (e.g. because that threshold already
+      accounts for the robot's own radius) without ever actually
+      entering the obstacle's interior, in which case ObstacleOnPath
+      does NOT fire for it. Needs the CURRENT walk's own trajectory
+      to check against, so this fails outright before any walk has
+      started (e.g. at s0) -- see holds(obstacle_on_path(...))'s own
+      comment in basic_action_theory.pl.
+    ports:
+      - name: threshold
+        direction: input
+        type: double
+        required: true
+        description: Distance threshold, metres.
+
+  # ----------------------------------------------------------------
+  # holds(battery_below(Threshold), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: BatteryBelow
+    prolog_condition: battery_below
+    description: >
+      True iff the CURRENT battery level (now/2 + battery/3) is below
+      Threshold -- a single battery/3 lookup, no black box involved.
+      SEPARATE from, and additional to, the fixed battery (=0%)
+      trigger/HaltedWith(battery_depleted) case -- this is a
+      genuinely different, caller-chosen threshold, not a replacement.
+    ports:
+      - name: threshold
+        direction: input
+        type: double
+        required: true
+        description: Battery level threshold, percent (0-100).
+
+  # ----------------------------------------------------------------
+  # holds(battery_equal(Threshold), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: BatteryEqual
+    prolog_condition: battery_equal
+    description: >
+      True iff the CURRENT battery level (now/2 + battery/3) is EXACTLY
+      Threshold (arithmetic equality) -- a single battery/3 lookup, no
+      black box involved. In a continuous, noise-driven model this is
+      only true at whatever instant Level(T) genuinely passes through
+      Threshold (see first_battery_equal_time's own note in
+      basic_action_theory.pl) -- checking it at an arbitrary current time
+      will usually be false.
+    ports:
+      - name: threshold
+        direction: input
+        type: double
+        required: true
+        description: Battery level threshold, percent (0-100).
+
+  # ----------------------------------------------------------------
+  # holds(battery_over(Threshold), S) in basic_action_theory.pl.
+  # ----------------------------------------------------------------
+  - id: BatteryOver
+    prolog_condition: battery_over
+    description: >
+      True iff the CURRENT battery level (now/2 + battery/3) is above
+      Threshold -- a single battery/3 lookup, no black box involved.
+      As a CONDITION this is an ordinary, well-defined point-in-time
+      check; only its TRIGGER counterpart is degenerate (see
+      first_battery_over_time's own note in basic_action_theory.pl for
+      why -- battery never rises within a walk).
+    ports:
+      - name: threshold
+        direction: input
+        type: double
+        required: true
+        description: Battery level threshold, percent (0-100).
+
+  # ----------------------------------------------------------------
+  # holds(line_of_sight_clear(ObstacleId,GX,GY), S) in
+  # basic_action_theory.pl -- Bug0's own boundary-leave rule as a
+  # standalone condition node. NO CrossesSegment condition counterpart
+  # exists -- "has my trajectory crossed this segment" is fundamentally
+  # an event over an interval of motion, not a fact true at a single
+  # instant the way this one is; see collision_geometry.py's own "BUG-
+  # ALGORITHM BOUNDARY-LEAVE PRIMITIVES" section for the full reasoning.
+  # crosses_segment(SX,SY,GX,GY) remains usable as a MoveTo TRIGGER
+  # (see MoveTo's own triggers port above) -- just not as a Condition
+  # leaf on its own.
+  # ----------------------------------------------------------------
+  - id: LineOfSightClear
+    prolog_condition: line_of_sight_clear
+    description: >
+      True iff the CURRENT position (now/2 + at/4) is NOT occluded
+      from goal by obstacle_id's own boundary -- a single-point check
+      reusing the exact same underlying geometry (collision_geometry.py's
+      line_of_sight_clear/segment_crosses_polygon) as the
+      line_of_sight_clear(ObstacleId,GX,GY) TRIGGER (Bug0's own leave
+      rule), just evaluated once instead of searched across a whole
+      future trajectory.
+    ports:
+      - name: obstacle_id
+        direction: input
+        type: std::string
+        required: true
+        description: >
+          Which obstacle_polygon/2 Id to check occlusion against --
+          see FollowBoarder's own obstacle_id port.
+      - name: goal
+        direction: input
+        type: Point
+        required: true
+        description: >
+          The point line-of-sight is checked toward -- see PlanAstar's
+          own goal port.

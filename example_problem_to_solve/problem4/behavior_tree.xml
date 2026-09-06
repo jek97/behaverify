@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<!--
+  behavior_tree.xml (problem4)
+
+  Deliberately the SIMPLEST possible reactive-redescend tree this
+  theory can express: no obstacle geometry anywhere, exactly ONE
+  reactive guard (BatteryOver, auto-derived into a trigger - see
+  below), and ONE fallback with two plain branches. Built for the
+  performance investigation into why the theory's exact inference
+  blows up once a fallback_node's branching gets chained across two or
+  more hops: this problem isolates that mechanism from every other
+  variable (obstacle count, polygon-restriction geometry, guard style)
+  that earlier testing already ruled out one at a time. ALSO used as
+  the regression case for bt_to_prolog.py's automatic guard-trigger
+  derivation (see that file's own module docstring, "CONTROL-FLOW
+  GUARD DERIVATION") - neither MoveTo below writes a triggers="..."
+  attribute at all.
+
+  Fallback (plain, non-reactive - BatteryFallback):
+    ReactiveSequence (branch 1, TryGoal - battery allows it):
+      BatteryOver threshold=70 : only try the goal leg if battery is
+        currently above 70%, checked FRESH each descent (a live state
+        check, not history-based), so it correctly fails on its own
+        once battery drops below 70% partway through branch 1's walk.
+      PlanStraight goal=22.275;2.075
+      MoveTo (no triggers="..." needed)
+    Sequence (plain - branch 2: go home):
+      PlanStraight goal=2.275;2.075
+      MoveTo (no triggers="..." needed)
+
+  Branch 1's own MoveTo gets collision/battery automatically (see
+  bt_to_prolog.py), PLUS an automatically-DERIVED guard_break trigger
+  from its own left sibling, BatteryOver threshold=70, tagged with the
+  code of the SPECIFIC ReactiveSequence "TryGoal" it's a sibling of
+  (translation assigns this the same way it always assigned a code to
+  every ReactiveSequence/ReactiveFallback occurrence - nothing here is
+  hand-picked). Firing it makes ONLY that ReactiveSequence restart its
+  own children (fresh, from BatteryOver) rather than redescending the
+  whole tree: BatteryOver now reads the CURRENT (already-below-70%)
+  battery level and fails immediately, so TryGoal (still non-reactive
+  as far as its own parent is concerned) simply fails, and the outer
+  plain BatteryFallback does what a plain fallback always does - falls
+  through to branch 2 (GoHome). Net effect is identical to the old
+  whole-tree redescend for this particular tree shape (unlike
+  problem3's obstacle_on_path, battery level is a simple state fluent
+  that's always meaningfully checkable, live, with no "was there ever
+  a walk in progress" precondition to work around), which is why this
+  problem is also used as the regression check that localized
+  redescend reproduces the prior global-redescend results.
+
+  Start position (2.275,2.075, this problem's own config.yaml) IS the
+  "home" this tree returns to; the goal (22.275,2.075) is 20 metres
+  east of it, tuned together with config.yaml's raised
+  moving_drain_rate (5.0%/time-unit, vs. problem0-3's shared 0.5) so
+  the walk crosses the 70% threshold well before reaching the goal.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Fallback name="BatteryFallback">
+      <ReactiveSequence name="TryGoal">
+        <BatteryOver threshold="70"/>
+        <PlanStraight goal="22.275;2.075" control_points="{cp}"/>
+        <MoveTo control_points="{cp}"/>
+      </ReactiveSequence>
+      <Sequence name="GoHome">
+        <PlanStraight goal="2.275;2.075" control_points="{cp2}"/>
+        <MoveTo control_points="{cp2}"/>
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Action ID="MoveTo">
+      <input_port name="control_points" type="std::vector&lt;Point&gt;"/>
+      <input_port name="triggers" type="std::vector&lt;std::string&gt;"/>
+      <output_port name="reason" type="std::string"/>
+      <output_port name="status" type="bool"/>
+    </Action>
+    <Action ID="PlanStraight">
+      <input_port name="goal" type="Point"/>
+      <output_port name="control_points" type="std::vector&lt;Point&gt;"/>
+      <output_port name="reason" type="std::string"/>
+      <output_port name="status" type="bool"/>
+    </Action>
+    <Condition ID="BatteryOver">
+      <input_port name="threshold" type="double"/>
+    </Condition>
+  </TreeNodesModel>
+</root>

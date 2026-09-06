@@ -1,0 +1,186 @@
+# config.yaml
+#
+# Single source of truth for every tunable constant in this PROBLEM's
+# own action theory instance. Previously these lived as scattered
+# `name(value).` facts directly inside basic_action_theory.pl; they are
+# now all here instead, so retuning the system means editing exactly
+# one file, in one place, with units documented next to each value.
+#
+# How this reaches the theory:
+#   - module/translators/config_to_prolog.py turns this file into
+#     config_generated.pl (plain Prolog facts, same names/arities as
+#     before, written into this same problem directory), which
+#     basic_action_theory.pl consults (via its problem_data.pl
+#     bootstrap -- see that file's Section 0).
+#   - main.py regenerates config_generated.pl from this file
+#     automatically before every run -- you never need to run the
+#     generator by hand for a normal run, only if you want to inspect
+#     the generated Prolog without also running inference.
+#   - collision_geometry.py (the collision/obstacle-sighted black box)
+#     reads bracket_samples / crossing_eps / position.lateral.sigma
+#     directly from THIS file too (not from the generated .pl), so both
+#     the Prolog and Python sides of the theory are driven by the exact
+#     same numbers with no risk of drift.
+#
+# config_generated.pl is committed to the repo (like this same
+# directory's obstacles_generated.pl already is) so that running
+# ProbLog directly against basic_action_theory.pl (per the project's
+# own testing convention) still works without going through main.py
+# first -- but treat it as a build artifact: edit this file, not that
+# one.
+#
+# WHAT ISN'T HERE, ON PURPOSE: which Triggers (collision/battery/
+# obstacle_in_bound/...) a given moveto_leg reacts to is NOT a config
+# value -- basic_action_theory.pl has no default_triggers fact and no
+# moveto_leg/1 sugar form. Every moveto_leg(CP,Triggers) call (in
+# plan/1, or in any BT node instantiated via module/contracts/
+# bt_actions.py's moveto_leg_term) states its own Triggers list
+# explicitly, right where the leg is written, e.g.
+# moveto_leg(CP,[collision,battery]) or moveto_leg(CP,[]) for a
+# genuinely unprotected leg. Each parametrized trigger/condition
+# (obstacle_in_bound(Threshold), battery_below(Threshold), etc.)
+# carries its own threshold as an argument at the call site instead, so
+# there is no per-trigger geometry config here either. The ONE
+# exception is battery.enabled below -- see that flag's own comment.
+#
+# LAYOUT: reorganized (from the earlier noise:/battery:/grounding:
+# split) into ONE section per physical quantity -- position: below
+# holds EVERYTHING about position noise (both the lateral z/2 and
+# tangential zt/2 axes) plus its own merge-grid quantization knob;
+# battery: holds EVERYTHING about battery (the enabled/disabled flag,
+# drain rates, noise, and its own merge-grid knob) in one place, rather
+# than the same physical quantity's settings being scattered across
+# three top-level sections. disc_step_time stays in its own small
+# grounding: section since it isn't position- or battery-specific (see
+# basic_action_theory.pl's own MERGE-GRID QUANTIZATION note, above
+# dist/5's own section, for the full mechanism all three merge-grid
+# knobs feed into).
+
+initial_situation:
+  # The robot's own position at s0 -- start/1 in the generated Prolog
+  # (see at(X,Y,_,s0) :- start(X,Y). in basic_action_theory.pl). Used to
+  # live in plan_generation/plan/current_plan.pl, alongside a global
+  # goal/2 fact and a now-superseded static control_points/1 -- that
+  # file is gone; start moved here (config.yaml is the single source
+  # of truth for everything else about the initial situation already:
+  # battery.start below, the noise model, robot geometry), and "the
+  # goal" now lives entirely in this problem's own goal_formula.pl
+  # (there is no longer a single global goal point at all -- see that
+  # file's own header, and basic_action_theory.pl's AtGoal condition,
+  # which now takes its own goal point as an explicit argument instead
+  # of reading one).
+  start_x: 2.275   # metres
+  start_y: 2.075   # metres
+
+robot:
+  radius: 0.20          # metres -- robot_radius/1
+  safety_buffer: 0.10   # metres -- safety_buffer/1 (safety_margin = radius + safety_buffer)
+
+motion:
+  speed: 1.0   # metres per time-unit -- constant-speed spline traversal (speed/1)
+
+position:
+  # EVERYTHING about position noise and its own merge-grid knob lives
+  # here -- lateral (z/2, per-walk NORMAL/steering drift) and
+  # tangential (zt/2, per-walk ALONG-PATH/timing drift) are INDEPENDENT
+  # random variables with their own discretized-Gaussian tables below
+  # -- different point counts and/or weights are fine, they don't have
+  # to match each other. Each table's weights MUST sum to EXACTLY 1.0:
+  # ProbLog silently treats missing annotated-disjunction mass as an
+  # implicit "none of these" failure branch, which caps EVERY
+  # downstream probability -- a real bug this project hit once
+  # already. The generator checks each table's sum separately and
+  # warns (but does not hard-fail, consistent with this project's
+  # existing choice not to hard-stop ProbLog loads) if any is off.
+  disc_step_position: 1.0   # metres -- rounds the position handed to planWith()
+                     # when planning a NEW leg's own control points, so
+                     # different noise draws that land close enough
+                     # together produce an IDENTICAL ground term for
+                     # ProbLog's own proof-sharing to merge (see
+                     # basic_action_theory.pl's own MERGE-GRID
+                     # QUANTIZATION note). 0 disables this (exact,
+                     # no merging).
+  lateral:
+    sigma: 0.15   # metres per sqrt(time-unit) -- z/2's scale (sigma/1)
+    discretized_gaussian:
+      - value: -1.0
+        weight: 0.25
+      - value: 0.0
+        weight: 0.5
+      - value: 1.0
+        weight: 0.25
+  tangential:
+    # Applied along the spline's own tangent direction at each point
+    # (a straight metric push, same Brownian-bridge growth law as
+    # lateral's own one -- see collision_geometry.py's own
+    # _walk_noisy_point for the exact formula and why this is a
+    # SEPARATE, independent draw from lateral's). Models speed/timing
+    # error (further along or behind the nominal schedule) as opposed
+    # to lateral's steering error (off to the side of it). Defaulted
+    # to the SAME sigma as lateral above -- retune independently once
+    # you have a real sense of which error source actually dominates
+    # for your robot.
+    sigma: 0.15   # metres per sqrt(time-unit) -- zt/2's scale (sigma_tangential/1)
+    discretized_gaussian:
+      - value: -1.0
+        weight: 0.25
+      - value: 0.0
+        weight: 0.5
+      - value: 1.0
+        weight: 0.25
+
+battery:
+  # EVERYTHING about battery lives here: whether it's modeled at all,
+  # its drain rates, its own noise, and its own merge-grid knob.
+  enabled: true   # if false: battery is NOT considered in this
+                   # problem at all -- module/translators/bt_to_prolog.py
+                   # strips every battery-related trigger name
+                   # (battery, battery_below(...), battery_over(...),
+                   # battery_equal(...)) out of every leg's own
+                   # Triggers list while translating behavior_tree.xml,
+                   # so the theory never halts a walk for a battery
+                   # reason, and config_to_prolog.py drops
+                   # query(any_battery_depletion) -- the one query
+                   # about "finishing the battery" -- so it's neither
+                   # computed nor reported. battery/3 (the fluent
+                   # itself) still exists and still tracks charge level
+                   # in the theory either way -- only whether it can
+                   # ever be a HALTING cause, and whether depletion is
+                   # queried, changes. Defaults to true.
+  start: 100                # percent -- battery_start/1
+  idle_drain_rate: 0.05     # percent/time-unit while not moving
+  moving_drain_rate: 5.0    # percent/time-unit while moving    # raised (from problem0-3's shared 0.5) so the
+                             # ~20-unit goal leg in THIS problem's own
+                             # behavior_tree.xml produces meaningful
+                             # battery dynamics -- see that file's own
+                             # header for why this problem exists.
+  sigma: 0.5   # percent per sqrt(time-unit) -- zbatt/1's scale (sigma_battery/1)
+  disc_step_battery: 10   # percent -- rounds a NEW leg's own starting battery
+                    # (floor, never overestimating remaining charge --
+                    # see basic_action_theory.pl's own MERGE-GRID
+                    # QUANTIZATION note). 0 disables this (exact).
+  discretized_gaussian:
+    - value: -1.0
+      weight: 0.25
+    - value: 0.0
+      weight: 0.5
+    - value: 1.0
+      weight: 0.25
+
+tolerances:
+  goal: 0.3       # metres -- goal_tolerance/1 (Status/goal_reached success check)
+  on_track: 0.5   # metres -- tolerance/1 (on_track/1 drift-reporting diagnostic)
+
+verification:
+  num_samples: 20        # reporting/plotting resolution -- decoupled from
+                          # detection, which is exact (see bracket_samples below)
+  bracket_samples: 60    # collision/obstacle_sighted bracket-scan sample count
+  crossing_eps: 0.01     # bisection refinement tolerance, time-units
+
+grounding:
+  # disc_step_time is the one discretization-step knob that ISN'T position- or
+  # battery-specific -- it rounds a NEW leg's own start time (ceiling,
+  # since a leg can never plausibly start before the previous one
+  # actually ended -- see basic_action_theory.pl's own MERGE-GRID
+  # QUANTIZATION note). 0 disables this (exact).
+  disc_step_time: 20   # seconds
