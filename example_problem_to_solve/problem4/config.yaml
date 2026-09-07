@@ -66,7 +66,7 @@ initial_situation:
   # battery.start below, the noise model, robot geometry), and "the
   # goal" now lives entirely in this problem's own goal_formula.pl
   # (there is no longer a single global goal point at all -- see that
-  # file's own header, and basic_action_theory.pl's AtGoal condition,
+  # file's own header, and basic_action_theory.pl's distance_below condition,
   # which now takes its own goal point as an explicit argument instead
   # of reading one).
   start_x: 2.275   # metres
@@ -168,7 +168,6 @@ battery:
       weight: 0.25
 
 tolerances:
-  goal: 0.3       # metres -- goal_tolerance/1 (Status/goal_reached success check)
   on_track: 0.5   # metres -- tolerance/1 (on_track/1 drift-reporting diagnostic)
 
 verification:

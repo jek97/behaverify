@@ -55,16 +55,19 @@ predicates:
   # Multi-waypoint / history-search fluents.
   # ----------------------------------------------------------------
   - name: visited
-    arity: 2
-    situation_arg: 2
+    arity: 3
+    situation_arg: 3
     args:
       - {position: 1, name: Loc, type: point(X,Y), description: "A waypoint, written point(X,Y) with literal numbers."}
-      - {position: 2, name: S, type: situation, description: "The situation to check at."}
+      - {position: 2, name: Tol, type: float, description: "Distance threshold, metres -- how close counts as \"arrived\"."}
+      - {position: 3, name: S, type: situation, description: "The situation to check at."}
     description: >
-      TRUE iff the robot ACTUALLY ARRIVED (Status=true -- landed
-      within goal_tolerance of that leg's own endpoint, not merely
-      Reason=completed) at Loc, the endpoint of SOME already-completed
-      MoveTo leg, anywhere in S's history. Monotonic: once true for a
+      TRUE iff the robot ACTUALLY ARRIVED (Reason=completed AND the
+      leg's own actual, noisy final position is within Tol of Loc --
+      re-derived directly via dist/5, same comparison as the
+      distance_below/3 condition, NOT merely Reason=completed alone)
+      at Loc, the endpoint of SOME already-completed MoveTo leg,
+      anywhere in S's history. Monotonic: once true for a
       situation, true for every situation built on top of it (a
       collision or battery depletion earlier in the SAME resolved
       world can instead make it FALSE by never reaching that far --

@@ -9,4 +9,4 @@
 % condition isn't needed here -- the queries that actually matter for
 % this diagnostic are plan_outcome/1 and any_battery_depletion.
 goal_formula(S) :-
-    visited(point(22.275,2.075), S).
+    visited(point(22.275,2.075), 0.3, S).

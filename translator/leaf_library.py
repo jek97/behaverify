@@ -1,13 +1,20 @@
 """
 Builds BehaVerify Action/Check IR objects for the BT.cpp action/condition
-vocabulary described in schema.yaml.
+vocabulary described in module/contracts/schema.yaml (the CURRENT schema,
+in problog_project -- PlanAstar/PlanStraight/PlanVoronoi/FollowBoarder were
+since unified into one PlanWith node with an `algorithm` port, and AtGoal
+was split into DistanceBelow/DistanceEqual/DistanceOver with a `threshold`
+port; see make_plan_with/_distance_check below).
 
-Scope, and why: this schema describes several planners (PlanAstar,
-PlanVoronoi, FollowBoarder) whose real implementations do black-box search
-over map geometry. Reproducing that inside nuXmv's model-checking language
-is out of scope for this translator -- their entries raise NotImplementedError
-with a clear message rather than silently mis-modeling a search algorithm.
-PlanStraight, MoveTo, and every plain fluent-lookup Condition (AtGoal,
+Scope: PlanWith(algorithm=straight) and PlanWith(algorithm=astar) ARE
+implemented (astar via a precomputed per-cell navigation policy -- see
+astar_policy.py's own header for why a full-grid policy, and why it
+doesn't just import planners.py). PlanWith(algorithm=voronoi/follow_boarder)
+and LineOfSightClear still raise NotImplementedError: voronoi would need
+the same "precomputed policy" treatment astar just got (not yet built),
+and follow_boarder has no fixed goal point to build a policy FROM at all
+(see planners.py's own header on why that planner takes no goal). MoveTo
+and every plain fluent-lookup Condition (DistanceBelow/Equal/Over,
 Battery*, ObstacleInBound/OnPath) ARE implemented.
 
 KEY SIMPLIFICATION (approved): motion advances exactly one grid cell per
@@ -20,14 +27,34 @@ anyone later choosing a larger per-tick step size, where it WOULD be
 needed again.)
 
 Per the same approved design: every MoveTo's `triggers=` XML attribute
-and BT.cpp's automatic collision/battery-trigger derivation are IGNORED.
-Only explicit sibling Condition nodes actually present in the tree affect
-behaviour (matching BehaVerify's own reactive, no-memory composite for a
-ReactiveSequence/ReactiveFallback -- see parse_behavior_tree.py). Battery
-reaching 0 mid-move is still handled inside MoveTo itself, since running out
-of energy is a physical property of the action, not a configurable trigger.
+and bt_to_prolog.py's automatic collision/battery-trigger/guard_break
+derivation are IGNORED. MoveTo is modeled purely as "advance one cell
+along whichever trajectory the preceding PlanWith produced, with noise
+applied" -- the only thing that can cut it short besides arrival/battery
+is a reactive Condition sibling, which BehaVerify's own reactive,
+no-memory composite already handles natively (see parse_behavior_tree.py),
+with no derived-trigger bookkeeping needed. Battery reaching 0 mid-move is
+still handled inside MoveTo itself, since running out of energy is a
+physical property of the action, not a configurable trigger.
 """
-from . import ir
+from . import astar_policy, ir
+
+
+def squared_distance_condition(x_name, y_name, gx, gy, threshold_cells, op):
+    """
+    A BehaVerify code_statement testing `op` (one of 'lt'/'eq'/'gt') between
+    the true Euclidean distance from (x_name,y_name) to (gx,gy) and
+    threshold_cells, WITHOUT using sqrt (not in BehaVerify's function_names
+    list) -- compares squared distance to squared threshold instead, valid
+    since both sides are non-negative and squaring is monotonic there.
+    Shared between LeafFactory's own distance checks and goal_formula.py's
+    visited/3 translation, so both use the same faithful (non-Chebyshev)
+    distance test.
+    """
+    dx = '(sub, {}, {})'.format(x_name, gx)
+    dy = '(sub, {}, {})'.format(y_name, gy)
+    dist_sq = '(add, (mult, {dx}, {dx}), (mult, {dy}, {dy}))'.format(dx=dx, dy=dy)
+    return '({}, {}, {})'.format(op, dist_sq, threshold_cells * threshold_cells)
 
 
 def _fmt(value):
@@ -169,6 +196,35 @@ class LeafFactory:
         self.actions[name] = action
         return name
 
+    def make_plan_with(self, algorithm, goal_x_m=None, goal_y_m=None, obstacle_id=None, offset=None):
+        """
+        Dispatches the CURRENT schema's single PlanWith node by its own
+        `algorithm` port. Returns (plan_action_name, moveto_action_name) --
+        the moveto_action_name is which MoveTo variant the NEXT MoveTo leaf
+        in the tree must reference (parse_behavior_tree.py threads this
+        through), since astar's own navigation table is baked into a
+        DEDICATED MoveTo_Astar_<goal> action, not the generic MoveTo.
+        """
+        if algorithm == 'straight':
+            return self.make_plan_straight(goal_x_m, goal_y_m), self.make_move_to()
+        if algorithm == 'astar':
+            return self.make_plan_astar(goal_x_m, goal_y_m)
+        if algorithm == 'voronoi':
+            raise NotImplementedError(
+                'PlanWith(algorithm=voronoi): not modeled by this translator yet. '
+                'astar is implemented as a precomputed per-cell navigation policy '
+                '(see astar_policy.py); voronoi would need the same treatment '
+                '(a per-cell policy following the free-space Voronoi roadmap) -- '
+                'not yet built.'
+            )
+        if algorithm == 'follow_boarder':
+            raise NotImplementedError(
+                'PlanWith(algorithm=follow_boarder): boundary-following planning is not '
+                'modeled by this translator -- it has no fixed goal point to build a '
+                'per-cell policy from (see planners.py\'s own header for why).'
+            )
+        raise NotImplementedError('PlanWith(algorithm={!r}): unrecognized algorithm.'.format(algorithm))
+
     def make_plan_straight(self, goal_x_m, goal_y_m):
         gx, gy = self.config.to_cell(goal_x_m), self.config.to_cell(goal_y_m)
         name = 'PlanStraight_{}_{}'.format(gx, gy).replace('-', 'm')
@@ -183,6 +239,78 @@ class LeafFactory:
         )
         self.actions[name] = action
         return name
+
+    def make_plan_astar(self, goal_x_m, goal_y_m):
+        """
+        Precomputes a per-cell navigation policy toward (goal_x_m,goal_y_m)
+        (see astar_policy.py), bakes it into two static DEFINE arrays
+        (dx/dy per cell, same array-lookup pattern as obstacle_clearance),
+        and builds a DEDICATED MoveTo_Astar_<goal> action that reads its
+        own step from that table instead of the generic MoveTo's
+        sign-toward-target heuristic. A cell the policy doesn't cover
+        (goal unreachable from there -- blocked or disconnected) defaults
+        to (0,0): MoveTo_Astar simply won't make progress from such a
+        cell (still subject to noise, so not necessarily perfectly frozen),
+        which is an honest degeneration given there's no PlanWith-level
+        Status/Reason=no_path signal modeled here to react to instead.
+        """
+        gx, gy = self.config.to_cell(goal_x_m), self.config.to_cell(goal_y_m)
+        plan_name = 'PlanAstar_{}_{}'.format(gx, gy).replace('-', 'm')
+        moveto_name = 'MoveTo_Astar_{}_{}'.format(gx, gy).replace('-', 'm')
+        if plan_name in self.actions:
+            return plan_name, moveto_name
+
+        obstacles_m = getattr(self.grid, 'obstacles_m', None)
+        if obstacles_m is None:
+            raise RuntimeError('LeafFactory.grid must carry .obstacles_m for astar support (set by translator/main.py).')
+        bounds = (self.grid.min_x, self.grid.max_x, self.grid.min_y, self.grid.max_y)
+        policy = astar_policy.compute_policy(obstacles_m, self.config.disc_step_position, bounds, (gx, gy))
+
+        dx_var = 'astar_dx_{}_{}'.format(gx, gy).replace('-', 'm')
+        dy_var = 'astar_dy_{}_{}'.format(gx, gy).replace('-', 'm')
+        dx_assigns = [(str(self.grid.flat_index(cx, cy)), str(dx)) for (cx, cy), (dx, _dy) in sorted(policy.items())]
+        dy_assigns = [(str(self.grid.flat_index(cx, cy)), str(dy)) for (cx, cy), (_dx, dy) in sorted(policy.items())]
+        array_size = str(self.grid.width * self.grid.height)
+        self.extra_variables.append(ir.Variable(dx_var, 'bl', 'DEFINE', 'INT', is_array=True, array_size=array_size, array_default='0', array_assigns=dx_assigns, static=True))
+        self.extra_variables.append(ir.Variable(dy_var, 'bl', 'DEFINE', 'INT', is_array=True, array_size=array_size, array_default='0', array_assigns=dy_assigns, static=True))
+
+        plan_action = ir.Action(
+            name=plan_name,
+            read_variables=[],
+            write_variables=['target_x', 'target_y'],
+            updates=[('var', 'target_x', str(gx)), ('var', 'target_y', str(gy))],
+            return_cases=[(None, 'success')],
+        )
+        self.actions[plan_name] = plan_action
+
+        flat_index_expr = '(add, (mult, (sub, x, MIN_X), GRID_HEIGHT), (sub, y, MIN_Y))'
+        dx_lookup = '(index, {}, {})'.format(dx_var, flat_index_expr)
+        dy_lookup = '(index, {}, {})'.format(dy_var, flat_index_expr)
+        next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, {dx}, noise_x))))))'.format(dx=dx_lookup)
+        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, {dy}, noise_y))))))'.format(dy=dy_lookup)
+        is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
+        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
+        moveto_action = ir.Action(
+            name=moveto_name,
+            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var],
+            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
+            updates=[
+                ('var', 'prev_x', 'x'),
+                ('var', 'prev_y', 'y'),
+                ('read_env', 'apply_noise', 'True', [
+                    ('x', next_x),
+                    ('y', next_y),
+                    ('battery', next_battery),
+                ]),
+            ],
+            return_cases=[
+                ('(and, (eq, x, target_x), (eq, y, target_y))', 'success'),
+                ('(lte, battery, 0)', 'failure'),
+                (None, 'running'),
+            ],
+        )
+        self.actions[moveto_name] = moveto_action
+        return plan_name, moveto_name
 
     # ------------------------------------------------------------------
     # Conditions
@@ -204,14 +332,26 @@ class LeafFactory:
         self.checks[name] = ir.Check(name, ['battery'], '({}, battery, {})'.format(op, threshold_int))
         return name
 
-    def make_at_goal(self, goal_x_m, goal_y_m, tolerance_m):
+    def make_distance_below(self, goal_x_m, goal_y_m, threshold_m):
+        return self._distance_check('DistanceBelow', 'lt', goal_x_m, goal_y_m, threshold_m)
+
+    def make_distance_equal(self, goal_x_m, goal_y_m, threshold_m):
+        return self._distance_check('DistanceEqual', 'eq', goal_x_m, goal_y_m, threshold_m)
+
+    def make_distance_over(self, goal_x_m, goal_y_m, threshold_m):
+        return self._distance_check('DistanceOver', 'gt', goal_x_m, goal_y_m, threshold_m)
+
+    def _distance_check(self, prefix, op, goal_x_m, goal_y_m, threshold_m):
         gx, gy = self.config.to_cell(goal_x_m), self.config.to_cell(goal_y_m)
-        tol = max(1, self.config.to_cells_nearest(tolerance_m))
-        name = 'AtGoal_{}_{}_{}'.format(gx, gy, tol).replace('-', 'm')
+        # ceil, not nearest/floor: a small threshold (e.g. 0.3m, smaller than
+        # one grid cell) must never round down to 0 -- for a 'lt' (DistanceBelow)
+        # check that would make even exact arrival (distance 0) fail, since
+        # 0 is not < 0. Ceiling guarantees a real arrival always satisfies it.
+        tol = max(1, self.config.to_cells_ceil(threshold_m))
+        name = '{}_{}_{}_{}'.format(prefix, gx, gy, tol).replace('-', 'm')
         if name in self.checks:
             return name
-        condition = '(and, (lte, (abs, (sub, x, {gx})), {tol}), (lte, (abs, (sub, y, {gy})), {tol}))'.format(gx=gx, gy=gy, tol=tol)
-        self.checks[name] = ir.Check(name, ['x', 'y'], condition)
+        self.checks[name] = ir.Check(name, ['x', 'y'], squared_distance_condition('x', 'y', gx, gy, tol, op))
         return name
 
     def make_obstacle_in_bound(self, threshold_m):
@@ -237,17 +377,8 @@ class LeafFactory:
         return name
 
     # ------------------------------------------------------------------
-    # Out of scope, on purpose (see module docstring)
+    # Out of scope, on purpose (see module docstring and make_plan_with)
     # ------------------------------------------------------------------
-    def make_plan_astar(self, *_args, **_kwargs):
-        raise NotImplementedError('PlanAstar: map-search planning is not modeled by this translator.')
-
-    def make_plan_voronoi(self, *_args, **_kwargs):
-        raise NotImplementedError('PlanVoronoi: map-search planning is not modeled by this translator.')
-
-    def make_follow_boarder(self, *_args, **_kwargs):
-        raise NotImplementedError('FollowBoarder: boundary-following planning is not modeled by this translator.')
-
     def make_line_of_sight_clear(self, *_args, **_kwargs):
         raise NotImplementedError('LineOfSightClear: occlusion geometry is not modeled by this translator.')
 

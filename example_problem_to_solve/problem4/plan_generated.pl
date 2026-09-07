@@ -2,8 +2,19 @@
 % behavior_tree.xml -- DO NOT HAND-EDIT,
 % edit the XML tree instead and regenerate (main.py does this
 % automatically before every run).
+%
+% Action code legend (see main.py's own printed copy of this):
+%   a1: PlanWith(straight, goal=point(22.275,2.075)) [TryGoal]
+%   a2: MoveTo(CP) [TryGoal]
+%   a3: PlanWith(straight, goal=point(2.275,2.075)) [GoHome]
+%   a4: MoveTo(CP2) [GoHome]
+%
+% Condition code legend (see main.py's own printed copy of this):
+%   c1: BatteryOver(threshold=70) [TryGoal]
+%   c2: DistanceBelow(goal=22.275;2.075,threshold=0.3) [TryGoal]
+%   c3: DistanceBelow(goal=2.275;2.075,threshold=0.3) [GoHome]
 
-plan(fallback_node([reactivesequence(rc1),seq_node([planWith(straight,point(2.275,2.075),CP2),moveto_leg(CP2,[collision,battery],a2)])])).
+plan(fallback_node([reactivesequence(rc1),seq_node([planWith(straight,point(2.275,2.075),CP2,a3),moveto_leg(CP2,[collision,battery],a4),cond(distance_below(2.275,2.075,0.3),c3)])])).
 
 % One reactive_children/2 fact per <ReactiveSequence>/
 % <ReactiveFallback> in the tree, keyed by the same code
@@ -12,4 +23,4 @@ plan(fallback_node([reactivesequence(rc1),seq_node([planWith(straight,point(2.27
 % theory.pl's own CONTROL-FLOW REDESCEND TARGETS note for why
 % these live as SEPARATE facts rather than being inlined.
 
-reactive_children(rc1, [cond(battery_over(70.0)),planWith(straight,point(22.275,2.075),CP),moveto_leg(CP,[collision,battery,guard_break(battery_over(70.0),rc1)],a1)]).
+reactive_children(rc1, [cond(battery_over(70.0),c1),planWith(straight,point(22.275,2.075),CP,a1),moveto_leg(CP,[collision,battery,guard_break(battery_over(70.0),rc1)],a2),cond(distance_below(22.275,2.075,0.3),c2)]).

@@ -5,21 +5,33 @@ node, and populates a LeafFactory with every action/check the tree
 actually needs.
 
 Composite mapping:
-  <Fallback>          -> selector, with_true_memory  (plain BT.cpp Fallback)
-  <ReactiveFallback>  -> selector, no memory ('')    (re-check every child from
-  <Sequence>          -> sequence, with_true_memory   the start each tick --
-  <ReactiveSequence>  -> sequence, no memory ('')      see leaf_library.py's
-                                                        module docstring and
-                                                        node_creator.py's
-                                                        create_composite_*_without_memory)
+  <Fallback>          -> selector, with_partial_memory (plain BT.cpp Fallback)
+  <ReactiveFallback>  -> selector, no memory ('')      (re-check every child from
+  <Sequence>          -> sequence, with_partial_memory  the start each tick --
+  <ReactiveSequence>  -> sequence, no memory ('')        see leaf_library.py's
+                                                          module docstring and
+                                                          node_creator.py's
+                                                          create_composite_*_without_memory)
 This reproduces BT.cpp's ReactiveSequence/ReactiveFallback restart-on-tick
 semantics NATIVELY, so a Condition left-sibling of a running action aborts
 it the moment the condition goes false -- no derived `triggers=`/guard_break
 bookkeeping needed (dropped entirely, per the approved design).
 
-Leaf mapping is schema.yaml's action/condition vocabulary, dispatched by
-XML tag name to a LeafFactory method (see leaf_library.py for what's
-implemented vs. explicitly out of scope).
+Leaf mapping is the CURRENT schema.yaml's action/condition vocabulary
+(PlanWith with an `algorithm` port replaces PlanAstar/PlanStraight/
+PlanVoronoi/FollowBoarder; DistanceBelow/DistanceEqual/DistanceOver with a
+`threshold` port replace AtGoal), dispatched by XML tag name to a
+LeafFactory method (see leaf_library.py for what's implemented vs.
+explicitly out of scope).
+
+PlanWith/MoveTo PAIRING: PlanWith writes its output to a `control_points`
+port a SUBSEQUENT MoveTo reads (wired via a shared blackboard key in the
+real XML, e.g. control_points="{cp}" on both). This translator doesn't
+track blackboard ports individually -- it assumes the same adjacency the
+real trees always use in practice: a MoveTo leaf is preceded, among its
+own composite's children, by the PlanWith that feeds it. _walk's composite
+loop below tracks "which MoveTo action the most recently seen PlanWith
+sibling selected" and hands it to the next MoveTo leaf it encounters.
 """
 import xml.etree.ElementTree as ET
 
@@ -44,28 +56,38 @@ def _parse_point(text):
     return float(x_str), float(y_str)
 
 
-def _build_leaf(tag, attrib, factory):
-    """Returns (leaf_kind, leaf_ref_name) for one XML leaf element."""
-    if tag == 'MoveTo':
-        return 'action', factory.make_move_to()
-    if tag == 'PlanStraight':
-        gx, gy = _parse_point(attrib['goal'])
-        return 'action', factory.make_plan_straight(gx, gy)
-    if tag == 'PlanAstar':
-        return 'action', factory.make_plan_astar()
-    if tag == 'PlanVoronoi':
-        return 'action', factory.make_plan_voronoi()
-    if tag == 'FollowBoarder':
-        return 'action', factory.make_follow_boarder()
+def _build_non_moveto_leaf(tag, attrib, factory):
+    """
+    Returns (leaf_kind, leaf_ref_name) for one XML leaf element, OR, for a
+    PlanWith, (leaf_kind, leaf_ref_name, next_moveto_name) -- the extra
+    element tells the caller which MoveTo action the following MoveTo leaf
+    must use. Never handles the 'MoveTo' tag itself -- see _walk, which
+    needs the pending-moveto state threaded from the composite loop.
+    """
+    if tag == 'PlanWith':
+        algorithm = attrib['algorithm']
+        goal_x_m = goal_y_m = None
+        if 'goal' in attrib:
+            goal_x_m, goal_y_m = _parse_point(attrib['goal'])
+        obstacle_id = attrib.get('obstacle_id')
+        offset = float(attrib['offset']) if 'offset' in attrib else None
+        plan_name, moveto_name = factory.make_plan_with(algorithm, goal_x_m, goal_y_m, obstacle_id, offset)
+        return 'action', plan_name, moveto_name
     if tag == 'BatteryOver':
         return 'check', factory.make_battery_over(float(attrib['threshold']))
     if tag == 'BatteryBelow':
         return 'check', factory.make_battery_below(float(attrib['threshold']))
     if tag == 'BatteryEqual':
         return 'check', factory.make_battery_equal(float(attrib['threshold']))
-    if tag == 'AtGoal':
+    if tag == 'DistanceBelow':
         gx, gy = _parse_point(attrib['goal'])
-        return 'check', factory.make_at_goal(gx, gy, float(attrib['tolerance']))
+        return 'check', factory.make_distance_below(gx, gy, float(attrib['threshold']))
+    if tag == 'DistanceEqual':
+        gx, gy = _parse_point(attrib['goal'])
+        return 'check', factory.make_distance_equal(gx, gy, float(attrib['threshold']))
+    if tag == 'DistanceOver':
+        gx, gy = _parse_point(attrib['goal'])
+        return 'check', factory.make_distance_over(gx, gy, float(attrib['threshold']))
     if tag == 'ObstacleInBound':
         return 'check', factory.make_obstacle_in_bound(float(attrib['threshold']))
     if tag == 'ObstacleOnPath':
@@ -82,12 +104,36 @@ def _walk(element, factory, path):
     if tag in _COMPOSITE_TAGS:
         node_type, memory = _COMPOSITE_TAGS[tag]
         name = element.attrib.get('name', tag)
-        children = [_walk(child, factory, path + [name]) for child in element]
+        children = []
+        pending_moveto = None  # set by the most recent PlanWith sibling, consumed by the next MoveTo
+        for child in element:
+            if child.tag == 'MoveTo':
+                moveto_name = pending_moveto if pending_moveto is not None else factory.make_move_to()
+                pending_moveto = None
+                alias = '_'.join(path + [name, 'MoveTo'])
+                children.append(ir.TreeNode(kind='leaf', leaf_kind='action', leaf_ref=moveto_name, name=alias))
+                continue
+            if child.tag in _COMPOSITE_TAGS or child.tag == 'Inverter':
+                children.append(_walk(child, factory, path + [name]))
+                continue
+            result = _build_non_moveto_leaf(child.tag, child.attrib, factory)
+            if len(result) == 3:
+                leaf_kind, leaf_ref, next_moveto = result
+                pending_moveto = next_moveto
+            else:
+                leaf_kind, leaf_ref = result
+            alias = '_'.join(path + [name, child.tag])
+            children.append(ir.TreeNode(kind='leaf', leaf_kind=leaf_kind, leaf_ref=leaf_ref, name=alias))
         return ir.TreeNode(kind='composite', node_type=node_type, memory=memory, name=name, children=children)
     if tag == 'Inverter':
         raise NotImplementedError('<Inverter> decorator translation is not implemented yet.')
-    # leaf
-    leaf_kind, leaf_ref = _build_leaf(tag, element.attrib, factory)
+    if tag == 'MoveTo':
+        # a MoveTo at the TREE ROOT (no enclosing composite to have carried a
+        # preceding PlanWith) -- always the generic, straight-line mover.
+        alias = '_'.join(path + ['MoveTo'])
+        return ir.TreeNode(kind='leaf', leaf_kind='action', leaf_ref=factory.make_move_to(), name=alias)
+    result = _build_non_moveto_leaf(tag, element.attrib, factory)
+    leaf_kind, leaf_ref = result[0], result[1]
     alias = '_'.join(path + [tag])
     return ir.TreeNode(kind='leaf', leaf_kind=leaf_kind, leaf_ref=leaf_ref, name=alias)
 
@@ -104,17 +150,18 @@ def collect_goal_points_m(xml_path):
     return points
 
 
-def collect_move_to_aliases(tree_node, move_to_action_name):
-    """All leaf aliases in the tree that instantiate the shared MoveTo action
-    -- used by goal_formula.py to build e.g. battery_depleted_in/1's
+def collect_move_to_aliases(tree_node):
+    """All leaf aliases in the tree that instantiate ANY MoveTo variant
+    (the generic 'MoveTo', or a goal-specific 'MoveTo_Astar_<goal>') --
+    used by goal_formula.py to build e.g. battery_depleted_in/1's
     `(or, (failure, alias1), (failure, alias2), ...)`."""
     aliases = []
     if tree_node.kind == 'leaf':
-        if tree_node.leaf_kind == 'action' and tree_node.leaf_ref == move_to_action_name:
+        if tree_node.leaf_kind == 'action' and tree_node.leaf_ref.startswith('MoveTo'):
             aliases.append(tree_node.name)
     else:
         for child in tree_node.children:
-            aliases.extend(collect_move_to_aliases(child, move_to_action_name))
+            aliases.extend(collect_move_to_aliases(child))
     return aliases
 
 

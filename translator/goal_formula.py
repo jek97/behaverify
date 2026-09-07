@@ -6,11 +6,14 @@ limitation -- see vocabulary.yaml's header) and translates it into a
 BehaVerify LTLSPEC code_statement, using vocabulary.yaml's own fluent
 vocabulary as the dispatch table.
 
-SCOPE: only the fluents actually needed so far are implemented (visited/2,
+SCOPE: only the fluents actually needed so far are implemented (visited/3,
 and battery_depleted_in/1 built from every MoveTo leaf's own `failure`
 status). Anything else raises NotImplementedError naming the exact
 unsupported predicate/arity, rather than silently mistranslating -- extend
-_DISPATCH as new goal formulas arrive.
+_DISPATCH as new goal formulas arrive. NOTE: visited/3 (with an explicit
+Tol argument) is the CURRENT signature (problog_project/module/theory/
+basic_action_theory.pl) -- an older visited/2 (no Tol, using a since-removed
+global goal_tolerance constant) is no longer produced by this codebase.
 
 TEMPORAL SHAPE: every fluent in vocabulary.yaml is either a HISTORY fluent
 (TRUE iff something happened anywhere up to S -- visited/2, the *_in/1
@@ -23,6 +26,8 @@ in plain LTL needs an explicit done-marker this translator does not yet
 add, so those raise NotImplementedError until one is designed.
 """
 import re
+
+from . import leaf_library
 
 _TOKEN_RE = re.compile(r"""
     \s*(?:
@@ -114,12 +119,25 @@ def _require_point(term):
 
 
 def _translate_visited(args, config, _factory, situation_var):
-    loc, s = args
+    # visited/3: visited(Loc, Tol, S) -- see problog_project/module/theory/
+    # basic_action_theory.pl's own visited/3 clauses. Tol is an explicit
+    # distance threshold (metres), not baked into a global goal_tolerance
+    # constant any more -- reuse the SAME squared-distance test (no sqrt)
+    # leaf_library.py's DistanceBelow/Equal/Over checks use, so a "visited"
+    # goal formula and an explicit DistanceBelow condition node agree on
+    # what "close enough" means.
+    loc, tol, s = args
     if s != ('var', situation_var):
-        raise NotImplementedError('visited/2\'s own situation argument must be goal_formula\'s own S (no nested situations).')
+        raise NotImplementedError('visited/3\'s own situation argument must be goal_formula\'s own S (no nested situations).')
+    if tol[0] != 'num':
+        raise NotImplementedError('visited/3\'s own Tol argument must be a literal number, found: {}'.format(tol))
     x_m, y_m = _require_point(loc)
     cx, cy = config.to_cell(x_m), config.to_cell(y_m)
-    return '(finally, (and, (eq, x, {}), (eq, y, {})))'.format(cx, cy)
+    # ceil, not nearest -- see leaf_library.py's _distance_check for why a
+    # small Tol must never round down to 0 (would make even exact arrival fail).
+    tol_cells = max(1, config.to_cells_ceil(tol[1]))
+    condition = leaf_library.squared_distance_condition('x', 'y', cx, cy, tol_cells, 'lte')
+    return '(finally, {})'.format(condition)
 
 
 def _translate_battery_depleted_in(args, _config, factory, situation_var):
@@ -137,7 +155,7 @@ def _translate_battery_depleted_in(args, _config, factory, situation_var):
 
 
 _DISPATCH = {
-    ('visited', 2): _translate_visited,
+    ('visited', 3): _translate_visited,
     ('battery_depleted_in', 1): _translate_battery_depleted_in,
 }
 

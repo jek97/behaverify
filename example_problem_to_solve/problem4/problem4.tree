@@ -23,6 +23,14 @@ check { BatteryOver_70
     arguments {} read_variables {battery}
     condition {(gt, battery, 70)}
 }
+check { DistanceBelow_22_2_1
+    arguments {} read_variables {x, y}
+    condition {(lt, (add, (mult, (sub, x, 22), (sub, x, 22)), (mult, (sub, y, 2), (sub, y, 2))), 1)}
+}
+check { DistanceBelow_2_2_1
+    arguments {} read_variables {x, y}
+    condition {(lt, (add, (mult, (sub, x, 2), (sub, x, 2)), (mult, (sub, y, 2), (sub, y, 2))), 1)}
+}
 }
 environment_checks {}
 actions {
@@ -78,9 +86,11 @@ tree {
                 children {
                     BatteryFallback_TryGoal_BatteryOver: BatteryOver_70 {}
 
-                    BatteryFallback_TryGoal_PlanStraight: PlanStraight_22_2 {}
+                    BatteryFallback_TryGoal_PlanWith: PlanStraight_22_2 {}
 
                     BatteryFallback_TryGoal_MoveTo: MoveTo {}
+
+                    BatteryFallback_TryGoal_DistanceBelow: DistanceBelow_22_2_1 {}
 
                 }
             }
@@ -88,9 +98,11 @@ tree {
             composite {GoHome
                 sequence with_partial_memory
                 children {
-                    BatteryFallback_GoHome_PlanStraight: PlanStraight_2_2 {}
+                    BatteryFallback_GoHome_PlanWith: PlanStraight_2_2 {}
 
                     BatteryFallback_GoHome_MoveTo: MoveTo {}
+
+                    BatteryFallback_GoHome_DistanceBelow: DistanceBelow_2_2_1 {}
 
                 }
             }
@@ -100,5 +112,5 @@ tree {
 }
 tick_prerequisite {True}
 specifications {
-    LTLSPEC {(finally, (and, (eq, x, 22), (eq, y, 2)))}
+    LTLSPEC {(finally, (lte, (add, (mult, (sub, x, 22), (sub, x, 22)), (mult, (sub, y, 2), (sub, y, 2))), 1))}
 }

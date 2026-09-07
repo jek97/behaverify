@@ -16,7 +16,6 @@ battery_start(100).
 idle_drain_rate(0.05).
 moving_drain_rate(5.0).
 disc_step_battery(10).
-goal_tolerance(0.3).
 tolerance(0.5).
 num_samples(20).
 bracket_samples(60).

@@ -74,7 +74,10 @@ class ProblemConfig:
         self.disc_step_battery = battery.get('disc_step_battery', 0)
         self.battery_noise_support = [pt['value'] for pt in battery['discretized_gaussian']]
 
-        self.goal_tolerance_m = raw['tolerances']['goal']
+        # NOTE: tolerances.goal was removed from config.yaml -- goal
+        # tolerance is no longer a single global config value, it's now
+        # per-node (DistanceBelow/DistanceEqual/DistanceOver's own
+        # `threshold` port, and visited/3's own explicit Tol argument).
         self.on_track_tolerance_m = raw['tolerances']['on_track']
 
         self.disc_step_time = raw['grounding']['disc_step_time']
@@ -91,8 +94,3 @@ class ProblemConfig:
     @property
     def start_cell(self):
         return (self.to_cell(self.start_x_m), self.to_cell(self.start_y_m))
-
-    @property
-    def goal_tolerance_cells(self):
-        # at least 1, so "within tolerance" is never vacuously "only the exact cell"
-        return max(1, self.to_cells_nearest(self.goal_tolerance_m))

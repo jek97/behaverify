@@ -22,12 +22,13 @@ def translate_problem(problem_dir, spec_type='LTLSPEC'):
     goal_points_m.append((config.start_x_m, config.start_y_m))
     bounds = parse_map.compute_grid_bounds(obstacles_m, goal_points_m, config)
     grid = parse_map.build_clearance_grid(obstacles_m, config, bounds)
+    grid.obstacles_m = obstacles_m  # needed by leaf_library.make_plan_astar's policy precomputation
 
     factory = LeafFactory(config, grid)
     shared_vars = factory.shared_variables()
 
     tree_root = parse_behavior_tree.parse_tree(xml_path, factory)
-    factory.move_to_aliases = parse_behavior_tree.collect_move_to_aliases(tree_root, 'MoveTo')
+    factory.move_to_aliases = parse_behavior_tree.collect_move_to_aliases(tree_root)
 
     goal_code = goal_formula.translate(os.path.join(problem_dir, 'goal_formula.pl'), config, factory)
 
