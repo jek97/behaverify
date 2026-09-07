@@ -25,11 +25,11 @@ check { BatteryOver_70
 }
 check { DistanceBelow_22_2_1
     arguments {} read_variables {x, y}
-    condition {(lt, (add, (mult, (sub, x, 22), (sub, x, 22)), (mult, (sub, y, 2), (sub, y, 2))), 1)}
+    condition {(lt, (max, (abs, (sub, x, 22)), (abs, (sub, y, 2))), 1)}
 }
 check { DistanceBelow_2_2_1
     arguments {} read_variables {x, y}
-    condition {(lt, (add, (mult, (sub, x, 2), (sub, x, 2)), (mult, (sub, y, 2), (sub, y, 2))), 1)}
+    condition {(lt, (max, (abs, (sub, x, 2)), (abs, (sub, y, 2))), 1)}
 }
 }
 environment_checks {}
@@ -112,5 +112,5 @@ tree {
 }
 tick_prerequisite {True}
 specifications {
-    LTLSPEC {(finally, (lte, (add, (mult, (sub, x, 22), (sub, x, 22)), (mult, (sub, y, 2), (sub, y, 2))), 1))}
+    LTLSPEC {(finally, (lte, (max, (abs, (sub, x, 22)), (abs, (sub, y, 2))), 1))}
 }

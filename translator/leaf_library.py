@@ -44,18 +44,29 @@ from . import astar_policy, ir
 def squared_distance_condition(x_name, y_name, gx, gy, threshold_cells, op):
     """
     A BehaVerify code_statement testing `op` (one of 'lt'/'eq'/'gt') between
-    the true Euclidean distance from (x_name,y_name) to (gx,gy) and
-    threshold_cells, WITHOUT using sqrt (not in BehaVerify's function_names
-    list) -- compares squared distance to squared threshold instead, valid
-    since both sides are non-negative and squaring is monotonic there.
-    Shared between LeafFactory's own distance checks and goal_formula.py's
-    visited/3 translation, so both use the same faithful (non-Chebyshev)
-    distance test.
+    (x_name,y_name) and (gx,gy)'s distance and threshold_cells, using
+    Chebyshev distance (max(|dx|,|dy|)) -- NOT true Euclidean distance.
+
+    An earlier version compared squared distance ((dx*dx)+(dy*dy)) to
+    threshold_cells**2 to avoid sqrt (not in BehaVerify's function_names
+    list) while staying geometrically exact. That MULTIPLIES two
+    variable-derived expressions together, which is a well-known blowup
+    case for BDD-based symbolic model checkers like nuXmv (multiplying two
+    range-bounded variables needs far more symbolic state than addition/
+    comparison) -- confirmed in practice: nuXmv was OOM-killed (exit -9)
+    generating this check for problem4, which plain generation-time
+    grammar checking has no way to catch (the blowup only shows up once
+    nuXmv actually tries to build/traverse the encoding). Chebyshev
+    distance only needs sub/abs/max/lte -- all linear, cheap to encode --
+    at the cost of being a squarish rather than circular "closeness"
+    region, which is an acceptable approximation at this grid's own
+    resolution. Shared between LeafFactory's own distance checks and
+    goal_formula.py's visited/3 translation.
     """
-    dx = '(sub, {}, {})'.format(x_name, gx)
-    dy = '(sub, {}, {})'.format(y_name, gy)
-    dist_sq = '(add, (mult, {dx}, {dx}), (mult, {dy}, {dy}))'.format(dx=dx, dy=dy)
-    return '({}, {}, {})'.format(op, dist_sq, threshold_cells * threshold_cells)
+    dx = '(abs, (sub, {}, {}))'.format(x_name, gx)
+    dy = '(abs, (sub, {}, {}))'.format(y_name, gy)
+    chebyshev = '(max, {dx}, {dy})'.format(dx=dx, dy=dy)
+    return '({}, {}, {})'.format(op, chebyshev, threshold_cells)
 
 
 def _fmt(value):
