@@ -344,26 +344,26 @@ To aquire nuXmv, see  https://nuxmv.fbk.eu/download.html or https://nuxmv.fbk.eu
 For the Linux version, please ensure you download the Linux 64-bit x86 version 2.1.0 (November 29, 2024). The executable will be located in **nuXmv-2.1.0-linux64/bin/nuXmv**. There should be **NO FILE EXTENSION**.
 
 ## translation
-given the Problog folder as the one already provided in example_problem_to_solve you can translate the files in the .tree input file for beha using the command: 
-'''
+given the ProbLog folder as the one already provided in example_problem_to_solve, you can translate its files into the .tree input file for BehaVerify using the command:
+```
 python3 -m translator.main example_problem_to_solve/<problem_name> example_problem_to_solve/<problem_name>/<problem_name>.tree
-'''
+```
 where:
 1. First arg: the problem's folder.
 2. Second arg: where to write the generated .tree file (convention so far: alongside the source files, named after the problem).
-3. Optional --spec_type CTLSPEC if you want the existential (best-case) reading instead of the default universal LTLSPEC � though as noted earlier, goal_formula.py's dispatch table currently emits LTL-only operators (finally, and, �), so switching to CTLSPEC would need those swapped for their CTL equivalents (exists_finally/always_finally) first; it's not just a flag flip yet.
+3. Optional `--spec_type CTLSPEC` if you want the existential (best-case) reading instead of the default universal LTLSPEC -- though as noted earlier, goal_formula.py's dispatch table currently emits LTL-only operators (finally, and, ...), so switching to CTLSPEC would need those swapped for their CTL equivalents (exists_finally/always_finally) first; it's not just a flag flip yet.
 
 If the tree uses a leaf type not yet implemented (PlanAstar, PlanVoronoi, FollowBoarder, LineOfSightClear, HaltedWith) or the goal formula references a fluent outside visited/2/battery_depleted_in/1, the translator will stop with a NotImplementedError naming exactly what's missing, rather than guessing.
 
 ## running the verification
 run the command:
-'''
+```
 behaverify nuxmv example_problem_to_solve/<problem_name>/<problem_name>.tree ./output --generate --ltl --nuxmv_path /path/to/nuXmv
-'''
+```
 where:
-1. --generate builds the SMV model from the .tree file.
-2. --ltl runs nuXmv's LTL model checking against every LTLSPEC in the file (add --ctl/--invar if a problem also has those).
-3. --nuxmv_path points at your downloaded nuXmv executable.
-4. Add -v for a readable pass/fail summary printed to the console instead of just the raw output file
+1. `--generate` builds the SMV model from the .tree file.
+2. `--ltl` runs nuXmv's LTL model checking against every LTLSPEC in the file (add `--ctl`/`--invar` if a problem also has those).
+3. `--nuxmv_path` points at your downloaded nuXmv executable.
+4. Add `-v` for a readable pass/fail summary printed to the console instead of just the raw output file.
 
-If you just want to sanity-check that a translated file is well-formed without running nuXmv (which is what I did for problem4), drop --ltl --nuxmv_path and only pass --generate � it'll parse, grammar-check, and produce the .smv file without needing the nuXmv binary at all.
+If you just want to sanity-check that a translated file is well-formed without running nuXmv (which is what was done for problem4), drop `--ltl --nuxmv_path` and only pass `--generate` -- it'll parse, grammar-check, and produce the .smv file without needing the nuXmv binary at all.
