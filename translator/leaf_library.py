@@ -6,15 +6,16 @@ since unified into one PlanWith node with an `algorithm` port, and AtGoal
 was split into DistanceBelow/DistanceEqual/DistanceOver with a `threshold`
 port; see make_plan_with/_distance_check below).
 
-Scope: PlanWith(algorithm=straight) and PlanWith(algorithm=astar) ARE
-implemented (astar via a precomputed per-cell navigation policy -- see
-astar_policy.py's own header for why a full-grid policy, and why it
-doesn't just import planners.py). PlanWith(algorithm=voronoi/follow_boarder)
-and LineOfSightClear still raise NotImplementedError: voronoi would need
-the same "precomputed policy" treatment astar just got (not yet built),
-and follow_boarder has no fixed goal point to build a policy FROM at all
-(see planners.py's own header on why that planner takes no goal). MoveTo
-and every plain fluent-lookup Condition (DistanceBelow/Equal/Over,
+Scope: PlanWith(algorithm=straight/astar/voronoi) ARE implemented, both
+astar and voronoi via a precomputed per-cell navigation policy -- see
+astar_policy.py's own header for why a full-grid policy, why it doesn't
+just import planners.py, and (for voronoi) exactly what its
+clearance-weighted flood is -- and isn't -- faithful to. PlanWith
+(algorithm=follow_boarder) and LineOfSightClear still raise
+NotImplementedError: follow_boarder has no fixed goal point to build a
+policy FROM at all (see planners.py's own header on why that planner
+takes no goal), and LineOfSightClear needs the same occlusion geometry.
+MoveTo and every plain fluent-lookup Condition (DistanceBelow/Equal/Over,
 Battery*, ObstacleInBound/OnPath) ARE implemented.
 
 KEY SIMPLIFICATION (approved): motion advances exactly one grid cell per
@@ -210,13 +211,7 @@ class LeafFactory:
         if algorithm == 'astar':
             return self.make_plan_astar(goal_x_m, goal_y_m)
         if algorithm == 'voronoi':
-            raise NotImplementedError(
-                'PlanWith(algorithm=voronoi): not modeled by this translator yet. '
-                'astar is implemented as a precomputed per-cell navigation policy '
-                '(see astar_policy.py); voronoi would need the same treatment '
-                '(a per-cell policy following the free-space Voronoi roadmap) -- '
-                'not yet built.'
-            )
+            return self.make_plan_voronoi(goal_x_m, goal_y_m)
         if algorithm == 'follow_boarder':
             raise NotImplementedError(
                 'PlanWith(algorithm=follow_boarder): boundary-following planning is not '
@@ -241,33 +236,49 @@ class LeafFactory:
         return name
 
     def make_plan_astar(self, goal_x_m, goal_y_m):
+        """Precomputed shortest-path (uniform-cost) navigation policy --
+        see _make_policy_based_plan's own docstring for the shared mechanism."""
+        return self._make_policy_based_plan('Astar', goal_x_m, goal_y_m, clearance_weight=0.0)
+
+    def make_plan_voronoi(self, goal_x_m, goal_y_m):
+        """
+        Precomputed clearance-WEIGHTED navigation policy -- same mechanism
+        as make_plan_astar, but the underlying flood (astar_policy.compute_policy
+        with clearance_weight>0) is biased away from tight passages, toward
+        high-clearance corridors, as a discrete stand-in for "route along
+        the free-space medial axis". See astar_policy.py's own "VORONOI,
+        HONESTLY" note for exactly what this is (and isn't) faithful to.
+        """
+        return self._make_policy_based_plan('Voronoi', goal_x_m, goal_y_m, clearance_weight=astar_policy.VORONOI_CLEARANCE_WEIGHT)
+
+    def _make_policy_based_plan(self, label, goal_x_m, goal_y_m, clearance_weight):
         """
         Precomputes a per-cell navigation policy toward (goal_x_m,goal_y_m)
         (see astar_policy.py), bakes it into two static DEFINE arrays
         (dx/dy per cell, same array-lookup pattern as obstacle_clearance),
-        and builds a DEDICATED MoveTo_Astar_<goal> action that reads its
+        and builds a DEDICATED MoveTo_<label>_<goal> action that reads its
         own step from that table instead of the generic MoveTo's
         sign-toward-target heuristic. A cell the policy doesn't cover
         (goal unreachable from there -- blocked or disconnected) defaults
-        to (0,0): MoveTo_Astar simply won't make progress from such a
+        to (0,0): MoveTo_<label> simply won't make progress from such a
         cell (still subject to noise, so not necessarily perfectly frozen),
         which is an honest degeneration given there's no PlanWith-level
         Status/Reason=no_path signal modeled here to react to instead.
         """
         gx, gy = self.config.to_cell(goal_x_m), self.config.to_cell(goal_y_m)
-        plan_name = 'PlanAstar_{}_{}'.format(gx, gy).replace('-', 'm')
-        moveto_name = 'MoveTo_Astar_{}_{}'.format(gx, gy).replace('-', 'm')
+        plan_name = 'Plan{}_{}_{}'.format(label, gx, gy).replace('-', 'm')
+        moveto_name = 'MoveTo_{}_{}_{}'.format(label, gx, gy).replace('-', 'm')
         if plan_name in self.actions:
             return plan_name, moveto_name
 
         obstacles_m = getattr(self.grid, 'obstacles_m', None)
         if obstacles_m is None:
-            raise RuntimeError('LeafFactory.grid must carry .obstacles_m for astar support (set by translator/main.py).')
+            raise RuntimeError('LeafFactory.grid must carry .obstacles_m for {} support (set by translator/main.py).'.format(label))
         bounds = (self.grid.min_x, self.grid.max_x, self.grid.min_y, self.grid.max_y)
-        policy = astar_policy.compute_policy(obstacles_m, self.config.disc_step_position, bounds, (gx, gy))
+        policy = astar_policy.compute_policy(obstacles_m, self.config.disc_step_position, bounds, (gx, gy), clearance_weight=clearance_weight)
 
-        dx_var = 'astar_dx_{}_{}'.format(gx, gy).replace('-', 'm')
-        dy_var = 'astar_dy_{}_{}'.format(gx, gy).replace('-', 'm')
+        dx_var = '{}_dx_{}_{}'.format(label.lower(), gx, gy).replace('-', 'm')
+        dy_var = '{}_dy_{}_{}'.format(label.lower(), gx, gy).replace('-', 'm')
         dx_assigns = [(str(self.grid.flat_index(cx, cy)), str(dx)) for (cx, cy), (dx, _dy) in sorted(policy.items())]
         dy_assigns = [(str(self.grid.flat_index(cx, cy)), str(dy)) for (cx, cy), (_dx, dy) in sorted(policy.items())]
         array_size = str(self.grid.width * self.grid.height)
