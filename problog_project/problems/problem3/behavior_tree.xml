@@ -1,0 +1,142 @@
+<?xml version="1.0"?>
+<!--
+  behavior_tree.xml (problem3)
+
+  A Bug0-style tree: go straight to the goal while the direct path is
+  clear; if an obstacle sits on that path, follow its boundary until
+  line of sight to the goal is regained, then resume straight.
+
+  <Fallback>
+    <Sequence>                     : Branch 1: path is clear
+      <Inverter><ObstacleOnPath/></Inverter>
+      <PlanWith algorithm="straight"/>
+      <MoveTo triggers="collision;battery;obstacle_on_path(T)"/>
+    </Sequence>
+    <Sequence>                     : Branch 2: obstacle blocks the path
+      <ObstacleOnPath/>
+      <PlanWith algorithm="follow_boarder"/>
+      <MoveTo triggers="collision;battery;line_of_sight_clear(...)"/>
+    </Sequence>
+  </Fallback>
+
+  Both ObstacleOnPath conditions are written EXPLICITLY near the root,
+  one per branch (plain, and inverted), so the tree's own shape reads
+  as the reactive condition it represents: "which branch applies"
+  reacts to whether an obstacle sits on the direct path: even though
+  this project's action theory is a ONE-SHOT Golog/ProbLog plan, not a
+  live re-ticked BT.cpp tree. The actual REACTIVE enforcement (an
+  obstacle appearing ON the path DURING Branch 1's own walk, or line of
+  sight clearing DURING Branch 2's own boundary walk) is realized the
+  only way this theory currently can: as a TRIGGER on the enclosing
+  MoveTo leaf (obstacle_on_path(T) / line_of_sight_clear(...) in each
+  branch's own triggers="..." above): the explicit Condition near the
+  root and the Trigger down at the leaf are the SAME underlying
+  condition, playing two different roles: the root-level Condition
+  documents "this branch only applies when..." for whoever reads the
+  tree, while the leaf-level Trigger is what actually halts a walk in
+  Poss(haltMoveto(...)) the moment that condition comes true mid-walk.
+  When Branch 1's own MoveTo halts via its obstacle_on_path(T) trigger
+  (Status=false, since the walk was cut short before its own nominal
+  endpoint), Branch 1's Sequence FAILS as a whole: fallback_node's own
+  documented "try the next branch from wherever the failed one left us"
+  semantics (see basic_action_theory.pl's own note above its
+  fallback_node clause) is what then hands control to Branch 2 WITHOUT
+  needing any explicit halt-reason check (no HaltedWith node): the
+  robot is exactly where the obstacle_on_path trigger caught it,
+  current_walk/5-visible, ready for Branch 2's own ObstacleOnPath
+  precondition and FollowBoarder planner to pick up from there.
+
+  KNOWN GAPS, NOT YET SUPPORTED by module/translators/bt_to_prolog.py
+  (this file is authored ahead of that work, per plan: it will not
+  translate/validate cleanly until the translator catches up):
+    1. <Inverter> (BT.cpp's built-in negation decorator) has no
+       translation branch yet: _CONTROL_FLOW only knows Sequence/
+       Fallback.
+    2. ObstacleOnPath used as a plain Condition LEAF (not inside a
+       Triggers list) translates today into a hard cond(obstacle_on_path
+       (Threshold)) precondition check via holds/2, which needs an
+       ALREADY-IN-PROGRESS walk (current_walk/5) to mean anything :
+       it always fails at s0/before any walk. As used HERE (in a
+       Fallback whose branches themselves start a fresh walk), the
+       translator needs to recognize this specific "guard for a
+       Sequence starting a new walk" shape and treat it as documentation
+       rather than a literal precondition: or the theory needs an
+       equivalent that also makes sense against a HYPOTHETICAL
+       not-yet-planned straight path. Exactly the follow-up work already
+       planned.
+    3. obstacle_id below is a LITERAL placeholder (obs3: the obstacle
+       this map's own straight start->goal line actually crosses,
+       picked so the tree is at least geometrically meaningful once it
+       does translate), not dynamically bound from Branch 1's own
+       obstacle_on_path(T,ObstacleId) trigger outcome the way a real
+       Bug0 needs (whichever obstacle actually blocked THIS run, not
+       always the same one): binding it dynamically is more translator
+       work, not yet built.
+
+  goal="11.675;11.525" matches this same directory's own goal_formula.pl:
+  see problem0/behavior_tree.xml's own header for the shared
+  goal/config-consistency rationale.
+
+  DistanceBelow, right after each branch's own MoveTo, confirms that
+  leg's own noisy final position actually landed within 0.3m of the
+  same goal PlanWith was working toward. See
+  problem0/behavior_tree.xml's own header for the full rationale (this
+  used to be baked into MoveTo's own status output, now an explicit
+  condition node instead; also present in this same directory's own
+  hand-written plan_generated.pl, see that file's own header for why
+  this tree doesn't yet translate to it directly).
+
+  PlanWith is the ONE consolidated planner action (see
+  problem0/behavior_tree.xml's own note); Branch 1 uses
+  algorithm="straight", Branch 2 uses algorithm="follow_boarder" (which
+  takes obstacle_id/offset instead of a goal port, see schema.yaml's
+  own note on PlanWith).
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Fallback name="Bug0">
+      <Sequence name="PathClear">
+        <Inverter>
+          <ObstacleOnPath threshold="0.6"/>
+        </Inverter>
+        <PlanWith algorithm="straight" goal="11.675;11.525" control_points="{cp}"/>
+        <MoveTo control_points="{cp}" triggers="collision;battery;obstacle_on_path(0.6)"/>
+        <DistanceBelow goal="11.675;11.525" threshold="0.3"/>
+      </Sequence>
+      <Sequence name="FollowObstacleBoundary">
+        <ObstacleOnPath threshold="0.6"/>
+        <PlanWith algorithm="follow_boarder" obstacle_id="obs3" offset="0.6" control_points="{cp2}"/>
+        <MoveTo control_points="{cp2}" triggers="collision;battery;line_of_sight_clear(obs3,11.675,11.525)"/>
+        <DistanceBelow goal="11.675;11.525" threshold="0.3"/>
+      </Sequence>
+    </Fallback>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Action ID="MoveTo">
+      <input_port name="control_points" type="std::vector&lt;Point&gt;"/>
+      <input_port name="triggers" type="std::vector&lt;std::string&gt;"/>
+      <output_port name="reason" type="std::string"/>
+      <output_port name="status" type="bool"/>
+    </Action>
+    <Action ID="PlanWith">
+      <input_port name="algorithm" type="std::string"/>
+      <input_port name="goal" type="Point"/>
+      <input_port name="obstacle_id" type="std::string"/>
+      <input_port name="offset" type="double"/>
+      <output_port name="control_points" type="std::vector&lt;Point&gt;"/>
+      <output_port name="reason" type="std::string"/>
+      <output_port name="status" type="bool"/>
+    </Action>
+    <Condition ID="ObstacleOnPath">
+      <input_port name="threshold" type="double"/>
+    </Condition>
+    <Condition ID="DistanceBelow">
+      <input_port name="goal" type="Point"/>
+      <input_port name="threshold" type="double"/>
+    </Condition>
+    <Condition ID="HaltedWith">
+      <input_port name="reason" type="std::string"/>
+    </Condition>
+  </TreeNodesModel>
+</root>
