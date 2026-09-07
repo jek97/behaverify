@@ -77,6 +77,16 @@ def _render_action(a):
             for var_name, value_code in var_assigns:
                 lines.append('            variable_statement {' + var_name + ' assign{result{' + value_code + '}}}')
             lines.append('        }')
+        elif entry[0] == 'case_var':
+            _, var_name, cases = entry
+            lines.append('        variable_statement {' + var_name + ' assign{')
+            for condition_code, values in cases:
+                values_text = ', '.join(values)
+                if condition_code is None:
+                    lines.append('            result {' + values_text + '}')
+                else:
+                    lines.append('            case {' + condition_code + '} result {' + values_text + '}')
+            lines.append('        }}')
         else:
             raise ValueError('Unknown action update entry kind: {}'.format(entry[0]))
     lines.append('        return_statement {')

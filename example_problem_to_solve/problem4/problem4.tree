@@ -1,6 +1,6 @@
 configuration {}
 enumerations {}
-constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5, IDLE_DRAIN := 0}
+constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5, IDLE_DRAIN := 0, DRIFT_RESAMPLE_PERIOD := 44}
 variables {
 variable { bl x VAR [MIN_X, MAX_X] assign{result{2}}}
 variable { bl y VAR [MIN_Y, MAX_Y] assign{result{2}}}
@@ -12,6 +12,8 @@ variable { bl battery VAR [0, 100] assign{result{100}}}
 variable { env noise_x VAR {-1, 0, 1} assign{result{0}}}
 variable { env noise_y VAR {-1, 0, 1} assign{result{0}}}
 variable { env battery_noise VAR {-1, 0, 1} assign{result{0}}}
+variable { bl lateral_offset VAR [-1, 1] assign{result{0}}}
+variable { bl ticks_since_resample VAR [0, DRIFT_RESAMPLE_PERIOD] assign{result{0}}}
 }
 environment_update {
 variable_statement { noise_x assign{result{(loop, __i, {-1, 0, 1} such_that True, __i)}}}
@@ -46,15 +48,23 @@ action { PlanStraight_22_2
     }
 }
 action { MoveTo
-    arguments {} local_variables {} read_variables {x, y, target_x, target_y, battery, noise_x, noise_y, battery_noise} write_variables {x, y, prev_x, prev_y, battery}
+    arguments {} local_variables {} read_variables {x, y, target_x, target_y, battery, noise_x, noise_y, battery_noise, lateral_offset, ticks_since_resample} write_variables {x, y, prev_x, prev_y, battery, lateral_offset, ticks_since_resample}
     initial_values {}
     update {
         variable_statement {prev_x assign{result{x}}}
         variable_statement {prev_y assign{result{y}}}
+        variable_statement {lateral_offset assign{
+            case {(gte, ticks_since_resample, DRIFT_RESAMPLE_PERIOD)} result {-1, 0, 1}
+            result {lateral_offset}
+        }}
+        variable_statement {ticks_since_resample assign{
+            case {(gte, ticks_since_resample, DRIFT_RESAMPLE_PERIOD)} result {0}
+            result {(add, ticks_since_resample, 1)}
+        }}
         read_environment {apply_noise
             condition {True}
-            variable_statement {x assign{result{(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), noise_x))))))}}}
-            variable_statement {y assign{result{(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y))))))}}}
+            variable_statement {x assign{result{(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, (add, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), noise_x), (if, (eq, lateral_offset, 0), 0, (if, (eq, lateral_offset, 1), (neg, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0))), (neg, (neg, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0))))))))))))}}}
+            variable_statement {y assign{result{(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y), (if, (eq, lateral_offset, 0), 0, (if, (eq, lateral_offset, 1), (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), (neg, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)))))))))))}}}
             variable_statement {battery assign{result{(max, 0, (sub, battery, (if, (or, (neq, x, prev_x), (neq, y, prev_y)), (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))}}}
         }
         return_statement {

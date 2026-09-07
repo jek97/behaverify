@@ -50,6 +50,15 @@ class Action:
     #       (REQUIRED to reference any `env`-scope variable inside value_code --
     #       check_grammar.py rejects a bare variable_statement that does, see
     #       leaf_library.py's make_move_to)
+    #   ('case_var', var_name, [(condition_code_or_None, [value_code, ...]), ...])
+    #       -- a variable_statement whose assign is a real case{}/result{} block
+    #       (last entry's condition should be None, the default branch). A
+    #       branch's own value list with MORE than one entry is itself a
+    #       NONDETERMINISTIC choice among them (same "multiple values in one
+    #       result{}" convention examples/DrunkenDrone's NextAct action uses)
+    #       -- this is the one thing a plain ('var', ...) single-expression
+    #       entry cannot express, since a nondeterministic choice needs the
+    #       DSL's own case/result list syntax, not a nested function call.
     updates: list = field(default_factory=list)
     # return_statement: list of (condition_code_or_None, status) with the last one being default (condition None)
     return_cases: list = field(default_factory=list)

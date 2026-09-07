@@ -102,6 +102,7 @@ class LeafFactory:
         # hardcoded 0 so a problem with a coarser/larger idle rate still
         # picks up the right value.
         self.constants['IDLE_DRAIN'] = int(round(config.idle_drain_rate))
+        self.constants['DRIFT_RESAMPLE_PERIOD'] = config.drift_resample_period_ticks
 
     # ------------------------------------------------------------------
     # shared state (x, y, battery, ...) -- added once, referenced by name
@@ -124,8 +125,67 @@ class LeafFactory:
             ir.Variable('noise_x', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.position_noise_support) + '}', initial=_fmt(0)),
             ir.Variable('noise_y', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.tangential_noise_support) + '}', initial=_fmt(0)),
             ir.Variable('battery_noise', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.battery_noise_support) + '}', initial=_fmt(0)),
+            # Slow, periodically-resampled lateral drift -- see
+            # _drift_updates/_drift_nudge below for the mechanism, and
+            # ProblemConfig.drift_resample_period_ticks for why the period
+            # is derived from config.yaml's own lateral sigma. Deliberately
+            # `bl` (persistent, held between ticks), not `env` (resampled
+            # every tick) like noise_x/noise_y -- the whole point is that it
+            # does NOT change every tick.
+            ir.Variable('lateral_offset', 'bl', 'VAR', '[-1, 1]', initial=_fmt(0)),
+            ir.Variable('ticks_since_resample', 'bl', 'VAR', '[0, DRIFT_RESAMPLE_PERIOD]', initial=_fmt(0)),
         ]
         return variables
+
+    def _drift_updates(self):
+        """
+        Shared ('case_var', ...) update entries for lateral_offset/
+        ticks_since_resample, appended to every MoveTo-family action's own
+        updates -- see shared_variables' own note on why this is a single,
+        mission-wide persistent process (not reset per-leg; a pragmatic
+        simplification -- the real system draws a fresh Z per WALK, this
+        drifts continuously across legs instead, which is simpler to wire
+        and still gives the same qualitative "long paths can drift a full
+        cell, short ones basically never do" behavior).
+        """
+        resample_due = '(gte, ticks_since_resample, DRIFT_RESAMPLE_PERIOD)'
+        return [
+            ('case_var', 'lateral_offset', [
+                (resample_due, ['-1', '0', '1']),
+                (None, ['lateral_offset']),
+            ]),
+            ('case_var', 'ticks_since_resample', [
+                (resample_due, ['0']),
+                (None, ['(add, ticks_since_resample, 1)']),
+            ]),
+        ]
+
+    @staticmethod
+    def _offset_scaled(value_code):
+        """
+        lateral_offset * value_code, WITHOUT using `mult` (multiplying two
+        variable-derived expressions is the exact pattern confirmed to blow
+        up nuXmv -- see squared_distance_condition's own note). lateral_offset
+        only ever takes 3 values, so an explicit case over them is cheap and
+        exact: 0 -> 0, +1 -> value_code, -1 -> -value_code.
+        """
+        return '(if, (eq, lateral_offset, 0), 0, (if, (eq, lateral_offset, 1), {v}, (neg, {v})))'.format(v=value_code)
+
+    def _drift_nudge(self, heading_x_code, heading_y_code):
+        """
+        The extra (dx,dy) this tick's step gets from the leg's own committed
+        lateral_offset, applied PERPENDICULAR to whatever the local heading
+        is -- (-heading_y, heading_x) is a 90-degree rotation that stays
+        within the same 8 king-move directions for ANY heading (including
+        diagonals), no trig/sqrt needed. heading_x_code/heading_y_code is
+        each caller's own notion of "local direction" -- the sign-toward-
+        target expression for a straight leg, or a direct policy-table
+        lookup for astar/voronoi -- so this same helper covers every
+        planner uniformly.
+        """
+        perp_x_code = '(neg, {})'.format(heading_y_code)
+        perp_y_code = heading_x_code
+        return self._offset_scaled(perp_x_code), self._offset_scaled(perp_y_code)
 
     def obstacle_variable(self):
         """Lazily builds the static obstacle-clearance lookup array (only if a
@@ -163,8 +223,11 @@ class LeafFactory:
         name = 'MoveTo'
         if name in self.actions:
             return name
-        step_x = '(max, -1, (min, 1, (add, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), noise_x)))'
-        step_y = '(max, -1, (min, 1, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y)))'
+        heading_x = '(if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0))'
+        heading_y = '(if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0))'
+        nudge_x, nudge_y = self._drift_nudge(heading_x, heading_y)
+        step_x = '(max, -1, (min, 1, (add, (add, {h}, noise_x), {n})))'.format(h=heading_x, n=nudge_x)
+        step_y = '(max, -1, (min, 1, (add, (add, {h}, noise_y), {n})))'.format(h=heading_y, n=nudge_y)
         next_x = '(max, MIN_X, (min, MAX_X, (add, x, {step})))'.format(step=step_x)
         next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, {step})))'.format(step=step_y)
         # Only pay the full moving_drain_rate (+ its noise) when the position
@@ -185,11 +248,16 @@ class LeafFactory:
         next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
         action = ir.Action(
             name=name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise'],
-            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
+            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', 'lateral_offset', 'ticks_since_resample'],
+            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery', 'lateral_offset', 'ticks_since_resample'],
             updates=[
                 ('var', 'prev_x', 'x'),
                 ('var', 'prev_y', 'y'),
+                # resample (or hold) the drift BEFORE computing this tick's
+                # step, so a fresh resample takes effect the same tick --
+                # both read the pre-tick ticks_since_resample (neither is
+                # staged yet at this point in the update block).
+            ] + self._drift_updates() + [
                 # x/y/battery all read env-scope noise variables, which
                 # check_grammar.py only allows inside a read_environment block
                 # (a bare variable_statement may only read blackboard/local vars).
@@ -308,17 +376,23 @@ class LeafFactory:
         flat_index_expr = '(add, (mult, (sub, x, MIN_X), GRID_HEIGHT), (sub, y, MIN_Y))'
         dx_lookup = '(index, {}, {})'.format(dx_var, flat_index_expr)
         dy_lookup = '(index, {}, {})'.format(dy_var, flat_index_expr)
-        next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, {dx}, noise_x))))))'.format(dx=dx_lookup)
-        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, {dy}, noise_y))))))'.format(dy=dy_lookup)
+        # local heading = the policy table's own recommended step at the
+        # CURRENT cell -- unlike a straight leg's single leg-wide heading,
+        # this naturally follows a bending astar/voronoi path, since it's
+        # re-read from the table fresh every tick.
+        nudge_x, nudge_y = self._drift_nudge(dx_lookup, dy_lookup)
+        next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, (add, {dx}, noise_x), {n}))))))'.format(dx=dx_lookup, n=nudge_x)
+        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, (add, {dy}, noise_y), {n}))))))'.format(dy=dy_lookup, n=nudge_y)
         is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
         next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
         moveto_action = ir.Action(
             name=moveto_name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var],
-            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
+            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', 'lateral_offset', 'ticks_since_resample', dx_var, dy_var],
+            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery', 'lateral_offset', 'ticks_since_resample'],
             updates=[
                 ('var', 'prev_x', 'x'),
                 ('var', 'prev_y', 'y'),
+            ] + self._drift_updates() + [
                 ('read_env', 'apply_noise', 'True', [
                     ('x', next_x),
                     ('y', next_y),

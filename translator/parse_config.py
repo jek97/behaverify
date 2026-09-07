@@ -65,6 +65,7 @@ class ProblemConfig:
 
         self.position_noise_support = [pt['value'] for pt in raw['position']['lateral']['discretized_gaussian']]
         self.tangential_noise_support = [pt['value'] for pt in raw['position']['tangential']['discretized_gaussian']]
+        self.lateral_sigma_m = raw['position']['lateral']['sigma']
 
         battery = raw['battery']
         self.battery_enabled = bool(battery.get('enabled', True))
@@ -94,3 +95,19 @@ class ProblemConfig:
     @property
     def start_cell(self):
         return (self.to_cell(self.start_x_m), self.to_cell(self.start_y_m))
+
+    @property
+    def drift_resample_period_ticks(self):
+        """
+        How many ticks of accumulated real Brownian drift it takes before a
+        full grid cell of lateral deviation becomes plausible -- used to
+        pace leaf_library.py's periodic lateral-drift resampling (see
+        make_move_to/_make_policy_based_plan). Derived directly from
+        config.yaml's own physics: lateral position variance grows as
+        sigma^2 * elapsed (sigma is "metres per sqrt(time-unit)"), and one
+        MoveTo tick == one time-unit (speed=1 m/time-unit, disc_step_position
+        m/cell -- see this module's own header). Solving
+        sigma^2 * t = disc_step_position^2 for t gives the tick count at
+        which the STANDARD DEVIATION of drift first reaches one cell width.
+        """
+        return max(1, round((self.disc_step_position / self.lateral_sigma_m) ** 2))
