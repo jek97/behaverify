@@ -1,6 +1,6 @@
 configuration {}
 enumerations {}
-constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5}
+constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5, IDLE_DRAIN := 0}
 variables {
 variable { bl x VAR [MIN_X, MAX_X] assign{result{2}}}
 variable { bl y VAR [MIN_Y, MAX_Y] assign{result{2}}}
@@ -47,7 +47,7 @@ action { MoveTo
             condition {True}
             variable_statement {x assign{result{(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), noise_x))))))}}}
             variable_statement {y assign{result{(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y))))))}}}
-            variable_statement {battery assign{result{(max, 0, (sub, battery, (add, MOVING_DRAIN, battery_noise)))}}}
+            variable_statement {battery assign{result{(max, 0, (sub, battery, (if, (or, (neq, x, prev_x), (neq, y, prev_y)), (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))}}}
         }
         return_statement {
             case {(and, (eq, x, target_x), (eq, y, target_y))} result {success}

@@ -58,6 +58,11 @@ class LeafFactory:
         self.constants['MAX_Y'] = grid.max_y
         self.constants['GRID_HEIGHT'] = grid.height
         self.constants['MOVING_DRAIN'] = int(round(config.moving_drain_rate))
+        # config.yaml's idle_drain_rate (0.05 in problem4) rounds to 0 at this
+        # model's integer-percent precision -- kept symbolic rather than
+        # hardcoded 0 so a problem with a coarser/larger idle rate still
+        # picks up the right value.
+        self.constants['IDLE_DRAIN'] = int(round(config.idle_drain_rate))
 
     # ------------------------------------------------------------------
     # shared state (x, y, battery, ...) -- added once, referenced by name
@@ -123,7 +128,22 @@ class LeafFactory:
         step_y = '(max, -1, (min, 1, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y)))'
         next_x = '(max, MIN_X, (min, MAX_X, (add, x, {step})))'.format(step=step_x)
         next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, {step})))'.format(step=step_y)
-        next_battery = '(max, 0, (sub, battery, (add, MOVING_DRAIN, battery_noise)))'
+        # Only pay the full moving_drain_rate (+ its noise) when the position
+        # actually changes this tick; an already-arrived MoveTo that keeps
+        # getting reticked (the tree runs forever) pays config.yaml's own
+        # idle_drain_rate instead -- otherwise battery drains to 0 purely
+        # from idling at the target, which nuXmv will (correctly) report as
+        # a real failure even though the robot never actually moved.
+        #
+        # NOTE: this must compare against prev_x/prev_y (captured BEFORE x/y
+        # are reassigned below), not by recomputing the next_x/next_y step
+        # formula again here -- by the time this statement runs, a bare `x`/`y`
+        # reference already resolves to the value x's/y's OWN variable_statement
+        # just staged earlier in this same update block, not the pre-tick one,
+        # so recomputing the step from `x` here would silently compare the new
+        # position against itself.
+        is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
+        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
         action = ir.Action(
             name=name,
             read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise'],
