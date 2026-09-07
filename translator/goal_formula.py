@@ -141,12 +141,24 @@ def _wrap_finally(condition, bound):
 
 def _translate_visited(args, config, _factory, situation_var, bound):
     # visited/3: visited(Loc, Tol, S) -- see problog_project/module/theory/
-    # basic_action_theory.pl's own visited/3 clauses. Tol is an explicit
-    # distance threshold (metres), not baked into a global goal_tolerance
-    # constant any more -- reuse the SAME squared-distance test (no sqrt)
-    # leaf_library.py's DistanceBelow/Equal/Over checks use, so a "visited"
-    # goal formula and an explicit DistanceBelow condition node agree on
-    # what "close enough" means.
+    # basic_action_theory.pl's own visited/3 clauses. Tol is nominally an
+    # explicit distance threshold (metres), but is NOT used to build an
+    # abs/max-based tolerance condition here (an earlier version did) --
+    # confirmed empirically (bisecting against a real nuXmv run) that
+    # carrying abs/max arithmetic through LTL's temporal wrapping
+    # (finally/finally_bounded) is dramatically more expensive for nuXmv
+    # than a plain equality condition, even though the SAME abs/max
+    # condition checks fine and fast as a plain INVARSPEC -- i.e. the
+    # cost is specific to the combination of this arithmetic with LTL's
+    # own tableau/bounded-unrolling construction, not the condition or
+    # the model alone. This isn't a loss of fidelity for THIS dynamics,
+    # though: MoveTo's own arrival check (leaf_library.make_move_to) is
+    # already exact cell equality (target_x/target_y are always integer
+    # cells), so the robot never lands "close but not exactly on" a
+    # target -- checking exact equality on the goal cell is equivalent
+    # to any Tol>=1 cell here, not an approximation of it. Tol is still
+    # validated (must be a literal number) so a genuinely fractional-cell
+    # semantics elsewhere would be caught, not silently ignored.
     loc, tol, s = args
     if s != ('var', situation_var):
         raise NotImplementedError('visited/3\'s own situation argument must be goal_formula\'s own S (no nested situations).')
@@ -154,10 +166,7 @@ def _translate_visited(args, config, _factory, situation_var, bound):
         raise NotImplementedError('visited/3\'s own Tol argument must be a literal number, found: {}'.format(tol))
     x_m, y_m = _require_point(loc)
     cx, cy = config.to_cell(x_m), config.to_cell(y_m)
-    # ceil, not nearest -- see leaf_library.py's _distance_check for why a
-    # small Tol must never round down to 0 (would make even exact arrival fail).
-    tol_cells = max(1, config.to_cells_ceil(tol[1]))
-    condition = leaf_library.squared_distance_condition('x', 'y', cx, cy, tol_cells, 'lte')
+    condition = '(and, (eq, x, {}), (eq, y, {}))'.format(cx, cy)
     return _wrap_finally(condition, bound)
 
 

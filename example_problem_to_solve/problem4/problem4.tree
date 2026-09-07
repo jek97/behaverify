@@ -112,5 +112,5 @@ tree {
 }
 tick_prerequisite {True}
 specifications {
-    LTLSPEC {(finally_bounded, [0, 100], (lte, (max, (abs, (sub, x, 22)), (abs, (sub, y, 2))), 1))}
+    LTLSPEC {(finally, (and, (eq, x, 22), (eq, y, 2)))}
 }
