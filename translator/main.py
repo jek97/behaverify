@@ -13,7 +13,7 @@ from . import emit_tree_dsl, goal_formula, ir, parse_behavior_tree, parse_config
 from .leaf_library import LeafFactory
 
 
-def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
+def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None, drift_period=None):
     config = parse_config.ProblemConfig(os.path.join(problem_dir, 'config.yaml'))
 
     obstacles_m = parse_map.parse_obstacles(os.path.join(problem_dir, 'obstacles_generated.pl'))
@@ -24,7 +24,7 @@ def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     grid = parse_map.build_clearance_grid(obstacles_m, config, bounds)
     grid.obstacles_m = obstacles_m  # needed by leaf_library.make_plan_astar's policy precomputation
 
-    factory = LeafFactory(config, grid)
+    factory = LeafFactory(config, grid, drift_period=drift_period)
     shared_vars = factory.shared_variables()
 
     tree_root = parse_behavior_tree.parse_tree(xml_path, factory)
@@ -76,9 +76,18 @@ def main(argv=None):
                               'same model checks fine as an INVARSPEC); a bound reduces the check to a finite '
                               'unrolling, which is typically far cheaper. Pick N comfortably larger than the '
                               'longest number of ticks any goal could plausibly take (e.g. grid width+height).')
+    parser.add_argument('--drift_period', type=int, default=None, metavar='N',
+                         help='Override DRIFT_RESAMPLE_PERIOD (ticks between lateral-drift resamples) instead of '
+                              'using config.yaml\'s physically-derived default. The default is sized from the '
+                              'real sigma in config.yaml and can be far larger than this problem\'s own legs '
+                              '(e.g. 44 ticks vs. a 6-20 tick leg), in which case the resample branch is never '
+                              'reached but nuXmv still pays for encoding the full [0, N] state range. Pick N '
+                              'proportionate to this problem\'s own longest leg to shrink that cost.')
     args = parser.parse_args(argv)
 
-    problem_ir = translate_problem(args.problem_dir, spec_type=args.spec_type, bound=args.bound)
+    problem_ir = translate_problem(
+        args.problem_dir, spec_type=args.spec_type, bound=args.bound, drift_period=args.drift_period,
+    )
     text = emit_tree_dsl.render(problem_ir)
     with open(args.output_tree, 'w', encoding='utf-8') as f:
         f.write(text)

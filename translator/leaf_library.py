@@ -79,7 +79,7 @@ def _fmt(value):
 
 
 class LeafFactory:
-    def __init__(self, config, grid):
+    def __init__(self, config, grid, drift_period=None):
         self.config = config
         self.grid = grid
         self.checks = {}  # name -> ir.Check
@@ -102,7 +102,15 @@ class LeafFactory:
         # hardcoded 0 so a problem with a coarser/larger idle rate still
         # picks up the right value.
         self.constants['IDLE_DRAIN'] = int(round(config.idle_drain_rate))
-        self.constants['DRIFT_RESAMPLE_PERIOD'] = config.drift_resample_period_ticks
+        # drift_period lets a caller override the physically-derived default
+        # (config.drift_resample_period_ticks) -- useful when a problem's own
+        # legs are much shorter than that period, since nuXmv still has to
+        # encode the full [0, DRIFT_RESAMPLE_PERIOD] state range even though
+        # the resample branch is never reached (see translator/main.py's
+        # --drift_period flag).
+        self.constants['DRIFT_RESAMPLE_PERIOD'] = (
+            drift_period if drift_period is not None else config.drift_resample_period_ticks
+        )
 
     # ------------------------------------------------------------------
     # shared state (x, y, battery, ...) -- added once, referenced by name

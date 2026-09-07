@@ -1,6 +1,6 @@
 configuration {}
 enumerations {}
-constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5, IDLE_DRAIN := 0, DRIFT_RESAMPLE_PERIOD := 44}
+constants {MIN_X := 0, MAX_X := 24, MIN_Y := 0, MAX_Y := 15, GRID_HEIGHT := 16, MOVING_DRAIN := 5, IDLE_DRAIN := 0, DRIFT_RESAMPLE_PERIOD := 8}
 variables {
 variable { bl x VAR [MIN_X, MAX_X] assign{result{2}}}
 variable { bl y VAR [MIN_Y, MAX_Y] assign{result{2}}}
