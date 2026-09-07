@@ -118,7 +118,28 @@ def _require_point(term):
     return term[2][0][1], term[2][1][1]  # (x, y) floats
 
 
-def _translate_visited(args, config, _factory, situation_var):
+def _wrap_finally(condition, bound):
+    """
+    `(finally, condition)` (unbounded F) if bound is None, else
+    `(finally_bounded, [0, bound], condition)` (nuXmv's bounded F[0,bound]).
+
+    WHY: unbounded LTL `F` requires nuXmv's general Buchi-tableau/fair-cycle
+    construction, which can blow up in practice even on a small, cheap
+    model (confirmed directly: this exact model checks fine as an
+    INVARSPEC -- i.e. the model itself is cheap to build -- but blows up
+    nuXmv's memory on plain LTLSPEC F(...)). A BOUNDED F[0,k] instead
+    reduces to a finite unrolling (much closer to reachability checking),
+    which is typically dramatically cheaper. Safe to use here because the
+    grid is small and MoveTo advances at most one cell/tick, so any
+    genuinely reachable goal is reachable well within a modest tick bound
+    -- see translator/main.py's --bound flag.
+    """
+    if bound is None:
+        return '(finally, {})'.format(condition)
+    return '(finally_bounded, [0, {}], {})'.format(bound, condition)
+
+
+def _translate_visited(args, config, _factory, situation_var, bound):
     # visited/3: visited(Loc, Tol, S) -- see problog_project/module/theory/
     # basic_action_theory.pl's own visited/3 clauses. Tol is an explicit
     # distance threshold (metres), not baked into a global goal_tolerance
@@ -137,10 +158,10 @@ def _translate_visited(args, config, _factory, situation_var):
     # small Tol must never round down to 0 (would make even exact arrival fail).
     tol_cells = max(1, config.to_cells_ceil(tol[1]))
     condition = leaf_library.squared_distance_condition('x', 'y', cx, cy, tol_cells, 'lte')
-    return '(finally, {})'.format(condition)
+    return _wrap_finally(condition, bound)
 
 
-def _translate_battery_depleted_in(args, _config, factory, situation_var):
+def _translate_battery_depleted_in(args, _config, factory, situation_var, bound):
     (s,) = args
     if s != ('var', situation_var):
         raise NotImplementedError('battery_depleted_in/1\'s own situation argument must be goal_formula\'s own S.')
@@ -151,7 +172,7 @@ def _translate_battery_depleted_in(args, _config, factory, situation_var):
     formula = failures[0]
     for extra in failures[1:]:
         formula = '(or, {}, {})'.format(formula, extra)
-    return '(finally, {})'.format(formula)
+    return _wrap_finally(formula, bound)
 
 
 _DISPATCH = {
@@ -160,10 +181,13 @@ _DISPATCH = {
 }
 
 
-def translate(path, config, factory):
+def translate(path, config, factory, bound=None):
     """Returns a single code_statement string: the AND of every conjunct's
     own translation. Raises NotImplementedError for any conjunct whose
-    predicate/arity isn't in _DISPATCH yet."""
+    predicate/arity isn't in _DISPATCH yet. `bound`, if given, makes every
+    `finally` a bounded `finally_bounded [0,bound]` instead -- see
+    _wrap_finally's own docstring for why that matters for nuXmv's
+    verification cost, not just generation."""
     situation_var, conjuncts = parse_goal_formula(path)
     pieces = []
     for term in conjuncts:
@@ -175,7 +199,7 @@ def translate(path, config, factory):
                 'goal_formula.pl uses {}/{}, which this translator does not yet support -- '
                 'add a case to translator/goal_formula.py\'s _DISPATCH table.'.format(*key)
             )
-        pieces.append(_DISPATCH[key](term[2], config, factory, situation_var))
+        pieces.append(_DISPATCH[key](term[2], config, factory, situation_var, bound))
     formula = pieces[0]
     for extra in pieces[1:]:
         formula = '(and, {}, {})'.format(formula, extra)

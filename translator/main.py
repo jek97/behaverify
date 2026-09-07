@@ -13,7 +13,7 @@ from . import emit_tree_dsl, goal_formula, ir, parse_behavior_tree, parse_config
 from .leaf_library import LeafFactory
 
 
-def translate_problem(problem_dir, spec_type='LTLSPEC'):
+def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     config = parse_config.ProblemConfig(os.path.join(problem_dir, 'config.yaml'))
 
     obstacles_m = parse_map.parse_obstacles(os.path.join(problem_dir, 'obstacles_generated.pl'))
@@ -30,7 +30,7 @@ def translate_problem(problem_dir, spec_type='LTLSPEC'):
     tree_root = parse_behavior_tree.parse_tree(xml_path, factory)
     factory.move_to_aliases = parse_behavior_tree.collect_move_to_aliases(tree_root)
 
-    goal_code = goal_formula.translate(os.path.join(problem_dir, 'goal_formula.pl'), config, factory)
+    goal_code = goal_formula.translate(os.path.join(problem_dir, 'goal_formula.pl'), config, factory, bound=bound)
 
     problem_ir = ir.ProblemIR()
     problem_ir.constants = [ir.Constant(name, value) for name, value in factory.constants.items()]
@@ -69,9 +69,16 @@ def main(argv=None):
     parser.add_argument('output_tree', help='output .tree file path')
     parser.add_argument('--spec_type', default='LTLSPEC', choices=['LTLSPEC', 'CTLSPEC', 'INVARSPEC'],
                          help='LTLSPEC = universal ("for all paths"); use CTLSPEC for an existential (EF-style) reading.')
+    parser.add_argument('--bound', type=int, default=None, metavar='N',
+                         help='Translate every `finally` (F) as a BOUNDED finally_bounded[0,N] instead of '
+                              'unbounded F. Unbounded LTL F requires nuXmv\'s general fairness/Buchi-automaton '
+                              'machinery, which can blow up in practice even on a cheap model (confirmed: this '
+                              'same model checks fine as an INVARSPEC); a bound reduces the check to a finite '
+                              'unrolling, which is typically far cheaper. Pick N comfortably larger than the '
+                              'longest number of ticks any goal could plausibly take (e.g. grid width+height).')
     args = parser.parse_args(argv)
 
-    problem_ir = translate_problem(args.problem_dir, spec_type=args.spec_type)
+    problem_ir = translate_problem(args.problem_dir, spec_type=args.spec_type, bound=args.bound)
     text = emit_tree_dsl.render(problem_ir)
     with open(args.output_tree, 'w', encoding='utf-8') as f:
         f.write(text)
