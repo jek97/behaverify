@@ -63,8 +63,14 @@ class ProblemConfig:
                 'translator -- nuXmv needs a finite grid; pick a nonzero step in config.yaml.'
             )
 
-        self.position_noise_support = [pt['value'] for pt in raw['position']['lateral']['discretized_gaussian']]
-        self.tangential_noise_support = [pt['value'] for pt in raw['position']['tangential']['discretized_gaussian']]
+        # NOTE: position's own per-tick discretized-Gaussian noise tables
+        # (position.lateral/position.tangential discretized_gaussian) aren't
+        # used -- position's only nondeterminism is the periodically-
+        # resampled lateral_offset drift (see leaf_library.py's
+        # make_move_to), which subsumed per-tick jitter as a redundant
+        # second noise source stacked into the same transition formula.
+        # lateral_sigma_m is kept only to pace that drift's resample period
+        # (drift_resample_period_ticks below).
         self.lateral_sigma_m = raw['position']['lateral']['sigma']
 
         battery = raw['battery']
@@ -75,7 +81,8 @@ class ProblemConfig:
         self.disc_step_battery = battery.get('disc_step_battery', 0)
         # NOTE: battery drain is deterministic (see leaf_library.py's
         # make_move_to) -- battery's own discretized_gaussian noise table
-        # isn't used; only position keeps a noise/drift term.
+        # isn't used either; position's lateral_offset drift is now the
+        # model's only nondeterminism.
 
         # NOTE: tolerances.goal was removed from config.yaml -- goal
         # tolerance is no longer a single global config value, it's now

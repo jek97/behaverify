@@ -128,22 +128,33 @@ class LeafFactory:
             ir.Variable('target_x', 'bl', 'VAR', '[MIN_X, MAX_X]', initial=_fmt(sx)),
             ir.Variable('target_y', 'bl', 'VAR', '[MIN_Y, MAX_Y]', initial=_fmt(sy)),
             ir.Variable('battery', 'bl', 'VAR', '[0, 100]', initial=_fmt(self.config.battery_start)),
-            # noise: nondeterministic environment choice, replacing the source
-            # system's discretized-Gaussian probability draws (see noise.py).
-            ir.Variable('noise_x', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.position_noise_support) + '}', initial=_fmt(0)),
-            ir.Variable('noise_y', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.tangential_noise_support) + '}', initial=_fmt(0)),
-            # battery_noise (an env choice like noise_x/noise_y) was removed:
-            # position keeps its own noise/drift, but battery drain is now
-            # deterministic (MOVING_DRAIN/IDLE_DRAIN exactly, no noise term)
-            # -- isolates whether position's own noise/drift is sufficient
-            # on its own to blow up nuXmv, independent of battery.
+            # battery_noise was removed: position keeps its own noise/drift,
+            # but battery drain is deterministic (MOVING_DRAIN/IDLE_DRAIN
+            # exactly, no noise term) -- isolates whether position's own
+            # noise/drift is sufficient on its own to blow up nuXmv,
+            # independent of battery.
+            #
+            # noise_x/noise_y (a per-tick nondeterministic env choice,
+            # translating the source system's discretized-Gaussian draws
+            # directly) was ALSO removed: it's redundant with the
+            # periodically-resampled lateral_offset drift below -- both are
+            # separate nondeterministic contributions stacked into the SAME
+            # clamped x/y transition formula, and per-tick jitter vs.
+            # slow cumulative drift are different timescale effects that
+            # don't both need modeling for this abstraction to be useful.
+            # Keeping only lateral_offset collapses position down to a
+            # single noise source, still qualitatively meaningful ("a leg
+            # can be nudged up to one cell off its straight line, and stays
+            # nudged for a while") -- and isolates whether STACKING two
+            # nondeterministic terms (vs. having just one) is itself what
+            # was costing nuXmv.
+            #
             # Slow, periodically-resampled lateral drift -- see
             # _drift_updates/_drift_nudge below for the mechanism, and
             # ProblemConfig.drift_resample_period_ticks for why the period
-            # is derived from config.yaml's own lateral sigma. Deliberately
-            # `bl` (persistent, held between ticks), not `env` (resampled
-            # every tick) like noise_x/noise_y -- the whole point is that it
-            # does NOT change every tick.
+            # is derived from config.yaml's own lateral sigma. `bl`
+            # (persistent, held between ticks), not `env` (resampled every
+            # tick) -- the whole point is that it does NOT change every tick.
             ir.Variable('lateral_offset', 'bl', 'VAR', '[-1, 1]', initial=_fmt(0)),
             ir.Variable('ticks_since_resample', 'bl', 'VAR', '[0, DRIFT_RESAMPLE_PERIOD]', initial=_fmt(0)),
         ]
@@ -238,8 +249,8 @@ class LeafFactory:
         heading_x = '(if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0))'
         heading_y = '(if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0))'
         nudge_x, nudge_y = self._drift_nudge(heading_x, heading_y)
-        step_x = '(max, -1, (min, 1, (add, (add, {h}, noise_x), {n})))'.format(h=heading_x, n=nudge_x)
-        step_y = '(max, -1, (min, 1, (add, (add, {h}, noise_y), {n})))'.format(h=heading_y, n=nudge_y)
+        step_x = '(max, -1, (min, 1, (add, {h}, {n})))'.format(h=heading_x, n=nudge_x)
+        step_y = '(max, -1, (min, 1, (add, {h}, {n})))'.format(h=heading_y, n=nudge_y)
         next_x = '(max, MIN_X, (min, MAX_X, (add, x, {step})))'.format(step=step_x)
         next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, {step})))'.format(step=step_y)
         # Only pay the full moving_drain_rate (+ its noise) when the position
@@ -263,7 +274,7 @@ class LeafFactory:
         next_battery = '(max, 0, (sub, battery, (if, {moving}, MOVING_DRAIN, IDLE_DRAIN)))'.format(moving=is_moving)
         action = ir.Action(
             name=name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'lateral_offset', 'ticks_since_resample'],
+            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'lateral_offset', 'ticks_since_resample'],
             write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery', 'lateral_offset', 'ticks_since_resample'],
             updates=[
                 ('var', 'prev_x', 'x'),
@@ -273,14 +284,12 @@ class LeafFactory:
                 # both read the pre-tick ticks_since_resample (neither is
                 # staged yet at this point in the update block).
             ] + self._drift_updates() + [
-                # x/y/battery all read env-scope noise variables, which
-                # check_grammar.py only allows inside a read_environment block
-                # (a bare variable_statement may only read blackboard/local vars).
-                ('read_env', 'apply_noise', 'True', [
-                    ('x', next_x),
-                    ('y', next_y),
-                    ('battery', next_battery),
-                ]),
+                # no env-scope reads left (noise_x/noise_y removed), so a
+                # plain variable_statement is fine here -- no read_environment
+                # wrapper needed.
+                ('var', 'x', next_x),
+                ('var', 'y', next_y),
+                ('var', 'battery', next_battery),
             ],
             return_cases=[
                 ('(and, (eq, x, target_x), (eq, y, target_y))', 'success'),
@@ -396,24 +405,23 @@ class LeafFactory:
         # this naturally follows a bending astar/voronoi path, since it's
         # re-read from the table fresh every tick.
         nudge_x, nudge_y = self._drift_nudge(dx_lookup, dy_lookup)
-        next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, (add, {dx}, noise_x), {n}))))))'.format(dx=dx_lookup, n=nudge_x)
-        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, (add, {dy}, noise_y), {n}))))))'.format(dy=dy_lookup, n=nudge_y)
+        next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, {dx}, {n}))))))'.format(dx=dx_lookup, n=nudge_x)
+        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, {dy}, {n}))))))'.format(dy=dy_lookup, n=nudge_y)
         is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
         # Battery drain is deterministic here too -- see make_move_to's note.
         next_battery = '(max, 0, (sub, battery, (if, {moving}, MOVING_DRAIN, IDLE_DRAIN)))'.format(moving=is_moving)
         moveto_action = ir.Action(
             name=moveto_name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'lateral_offset', 'ticks_since_resample', dx_var, dy_var],
+            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'lateral_offset', 'ticks_since_resample', dx_var, dy_var],
             write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery', 'lateral_offset', 'ticks_since_resample'],
             updates=[
                 ('var', 'prev_x', 'x'),
                 ('var', 'prev_y', 'y'),
             ] + self._drift_updates() + [
-                ('read_env', 'apply_noise', 'True', [
-                    ('x', next_x),
-                    ('y', next_y),
-                    ('battery', next_battery),
-                ]),
+                # no env-scope reads left, no read_environment wrapper needed.
+                ('var', 'x', next_x),
+                ('var', 'y', next_y),
+                ('var', 'battery', next_battery),
             ],
             return_cases=[
                 ('(and, (eq, x, target_x), (eq, y, target_y))', 'success'),
