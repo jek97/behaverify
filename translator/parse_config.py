@@ -63,8 +63,10 @@ class ProblemConfig:
                 'translator -- nuXmv needs a finite grid; pick a nonzero step in config.yaml.'
             )
 
-        self.position_noise_support = [pt['value'] for pt in raw['position']['lateral']['discretized_gaussian']]
-        self.tangential_noise_support = [pt['value'] for pt in raw['position']['tangential']['discretized_gaussian']]
+        # Position is modeled deterministically (see leaf_library.py's
+        # MoveTo) -- the discretized-Gaussian lateral/tangential position
+        # noise tables aren't used; lateral_sigma_m is kept only to pace
+        # the battery drift's resample period below (drift_resample_period_ticks).
         self.lateral_sigma_m = raw['position']['lateral']['sigma']
 
         battery = raw['battery']
@@ -100,10 +102,13 @@ class ProblemConfig:
     def drift_resample_period_ticks(self):
         """
         How many ticks of accumulated real Brownian drift it takes before a
-        full grid cell of lateral deviation becomes plausible -- used to
-        pace leaf_library.py's periodic lateral-drift resampling (see
-        make_move_to/_make_policy_based_plan). Derived directly from
-        config.yaml's own physics: lateral position variance grows as
+        full grid cell of lateral deviation becomes plausible -- reused (not
+        for position, which is modeled deterministically -- see
+        leaf_library.py's MoveTo) to pace how often the battery's
+        nondeterministic drift term gets resampled (make_move_to/
+        _make_policy_based_plan's shared _battery_drift_updates). Derived
+        directly from config.yaml's own physics: lateral position variance
+        grows as
         sigma^2 * elapsed (sigma is "metres per sqrt(time-unit)"), and one
         MoveTo tick == one time-unit (speed=1 m/time-unit, disc_step_position
         m/cell -- see this module's own header). Solving
