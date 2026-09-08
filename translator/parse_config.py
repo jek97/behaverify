@@ -63,15 +63,8 @@ class ProblemConfig:
                 'translator -- nuXmv needs a finite grid; pick a nonzero step in config.yaml.'
             )
 
-        # NOTE: position's own per-tick discretized-Gaussian noise tables
-        # (position.lateral/position.tangential discretized_gaussian) aren't
-        # used -- position's only nondeterminism is the periodically-
-        # resampled lateral_offset drift (see leaf_library.py's
-        # make_move_to), which subsumed per-tick jitter as a redundant
-        # second noise source stacked into the same transition formula.
-        # lateral_sigma_m is kept only to pace that drift's resample period
-        # (drift_resample_period_ticks below).
-        self.lateral_sigma_m = raw['position']['lateral']['sigma']
+        self.position_noise_support = [pt['value'] for pt in raw['position']['lateral']['discretized_gaussian']]
+        self.tangential_noise_support = [pt['value'] for pt in raw['position']['tangential']['discretized_gaussian']]
 
         battery = raw['battery']
         self.battery_enabled = bool(battery.get('enabled', True))
@@ -79,10 +72,7 @@ class ProblemConfig:
         self.idle_drain_rate = battery['idle_drain_rate']
         self.moving_drain_rate = battery['moving_drain_rate']
         self.disc_step_battery = battery.get('disc_step_battery', 0)
-        # NOTE: battery drain is deterministic (see leaf_library.py's
-        # make_move_to) -- battery's own discretized_gaussian noise table
-        # isn't used either; position's lateral_offset drift is now the
-        # model's only nondeterminism.
+        self.battery_noise_support = [pt['value'] for pt in battery['discretized_gaussian']]
 
         # NOTE: tolerances.goal was removed from config.yaml -- goal
         # tolerance is no longer a single global config value, it's now
@@ -104,19 +94,3 @@ class ProblemConfig:
     @property
     def start_cell(self):
         return (self.to_cell(self.start_x_m), self.to_cell(self.start_y_m))
-
-    @property
-    def drift_resample_period_ticks(self):
-        """
-        How many ticks of accumulated real Brownian drift it takes before a
-        full grid cell of lateral deviation becomes plausible -- used to
-        pace leaf_library.py's periodic lateral-drift resampling (see
-        make_move_to/_make_policy_based_plan). Derived directly from
-        config.yaml's own physics: lateral position variance grows as
-        sigma^2 * elapsed (sigma is "metres per sqrt(time-unit)"), and one
-        MoveTo tick == one time-unit (speed=1 m/time-unit, disc_step_position
-        m/cell -- see this module's own header). Solving
-        sigma^2 * t = disc_step_position^2 for t gives the tick count at
-        which the STANDARD DEVIATION of drift first reaches one cell width.
-        """
-        return max(1, round((self.disc_step_position / self.lateral_sigma_m) ** 2))
