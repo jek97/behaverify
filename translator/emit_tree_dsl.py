@@ -12,6 +12,11 @@ def _indent(level):
     return '    ' * level
 
 
+def _render_enumerations(enumerations):
+    body = ', '.join(enumerations)
+    return 'enumerations {\n    ' + body + '\n}\n' if enumerations else 'enumerations {}\n'
+
+
 def _render_constants(constants):
     body = ', '.join('{} := {}'.format(c.name, c.value) for c in constants)
     return 'constants {' + body + '}\n'
@@ -123,7 +128,7 @@ def _render_tree_node(node, level):
 def render(problem_ir):
     out = []
     out.append('configuration {}\n')
-    out.append('enumerations {}\n')
+    out.append(_render_enumerations(problem_ir.enumerations))
     out.append(_render_constants(problem_ir.constants))
     out.append(_render_variables(problem_ir.variables))
     out.append(_render_environment_update(problem_ir.environment_update))

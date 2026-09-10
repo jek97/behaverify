@@ -86,6 +86,10 @@ class Specification:
 
 @dataclass
 class ProblemIR:
+    # quoted enum atom literals (e.g. "'free'", "'cart'", "'plow'") that
+    # appear in any variable's domain -- check_grammar.py requires every
+    # such atom to be declared here before a variable's domain can use it.
+    enumerations: list = field(default_factory=list)
     constants: list = field(default_factory=list)
     variables: list = field(default_factory=list)
     environment_update: list = field(default_factory=list)  # list of (var_name, value_code)

@@ -96,6 +96,17 @@ def _build_non_moveto_leaf(tag, attrib, factory):
         return 'check', factory.make_line_of_sight_clear()
     if tag == 'HaltedWith':
         return 'check', factory.make_halted_with()
+    if tag == 'TakeSample':
+        return 'action', factory.make_take_sample()
+    if tag == 'InstallTool':
+        # `triggers=` (EXTRA battery-only halting conditions, beyond the
+        # always-on battery=0% one) is deliberately ignored here, same
+        # established precedent as MoveTo's own `triggers=` attribute --
+        # a reactive Condition sibling in a ReactiveSequence/Fallback
+        # achieves the same effect natively (see this module's own header).
+        return 'action', factory.make_install_tool(attrib['tool'])
+    if tag == 'UninstallTool':
+        return 'action', factory.make_uninstall_tool(attrib['tool'])
     raise NotImplementedError('Unrecognized behavior_tree.xml tag: <{}> -- not in schema.yaml\'s vocabulary.'.format(tag))
 
 
@@ -148,6 +159,20 @@ def collect_goal_points_m(xml_path):
         if 'goal' in element.attrib:
             points.append(_parse_point(element.attrib['goal']))
     return points
+
+
+def uses_tool_actions(xml_path):
+    """
+    True iff behavior_tree.xml contains an InstallTool/UninstallTool node
+    anywhere -- checked BEFORE parse_tree() so LeafFactory.shared_variables
+    can decide, upfront, whether MoveTo needs to be hitch-aware (see
+    leaf_library.py's _moving_drain_for_hitch) without retroactively
+    rewriting an already-built MoveTo action once one of these tags is
+    found deeper in the tree walk (build order depends on XML structure,
+    not a fixed pass).
+    """
+    tree = ET.parse(xml_path)
+    return any(el.tag in ('InstallTool', 'UninstallTool') for el in tree.getroot().iter())
 
 
 def collect_move_to_aliases(tree_node):

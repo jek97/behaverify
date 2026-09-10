@@ -82,6 +82,63 @@ class ProblemConfig:
 
         self.disc_step_time = raw['grounding']['disc_step_time']
 
+        # ------------------------------------------------------------
+        # TakeSample / InstallTool / UninstallTool (new actions in the
+        # source theory -- see basic_action_theory.pl's own
+        # do_node(take_sample(...))/install_tool_leg/uninstall_tool_leg).
+        # Same key shape and defaults as config_to_prolog.py's own
+        # _binary_result_block/_tool_duration_facts/_tool_moveto_param_facts,
+        # so a config.yaml with none of these sections behaves exactly
+        # like the source system's own defaults.
+        # ------------------------------------------------------------
+        self.sample_success_probability = float(raw.get('sample', {}).get('success_probability', 0.5))
+
+        tool_cfg = raw.get('tool', {})
+        install_cfg = tool_cfg.get('install', {})
+        uninstall_cfg = tool_cfg.get('uninstall', {})
+        equipped_cfg = tool_cfg.get('equipped', {})
+
+        self.install_success_probability = float(install_cfg.get('success_probability', 0.9))
+        self.uninstall_success_probability = float(uninstall_cfg.get('success_probability', 0.9))
+        # ONE drain rate per action TYPE (not per tool) -- matches
+        # config_to_prolog.py's own install_tool_drain_rate/1/
+        # uninstall_tool_drain_rate/1 shape.
+        self.install_drain_rate = float(install_cfg.get('drain_rate', self.idle_drain_rate))
+        self.uninstall_drain_rate = float(uninstall_cfg.get('drain_rate', self.idle_drain_rate))
+        self._install_duration_s = install_cfg.get('duration_seconds', {})
+        self._uninstall_duration_s = uninstall_cfg.get('duration_seconds', {})
+
+        # tool.equipped.<cart|plow>.moving_drain_rate: the MoveTo drain
+        # rate used WHILE that tool is equipped (hitch(Tool,S) --
+        # basic_action_theory.pl's own tool_moving_drain_rate/2), reused
+        # by leaf_library.py's _moving_drain_for_hitch. Defaults to the
+        # SAME moving_drain_rate as no tool equipped, matching
+        # tool_moving_drain_rate(free,_)'s own reuse of battery.moving_
+        # drain_rate. NOTE: tool.equipped.<tool>.speed is intentionally
+        # NOT read here -- see leaf_library.py's _moving_drain_for_hitch
+        # docstring for why velocity-while-equipped is out of scope.
+        self.tool_moving_drain_rate = {
+            tool: float(equipped_cfg.get(tool, {}).get('moving_drain_rate', self.moving_drain_rate))
+            for tool in ('cart', 'plow')
+        }
+
+    def install_duration_ticks(self, tool):
+        """
+        config.yaml's tool.install.duration_seconds.<tool> (default 10s,
+        matching config_to_prolog.py's own _DEFAULT_TOOL_DURATION_S),
+        rounded DIRECTLY to ticks -- this translator has no other
+        seconds<->tick conversion anywhere (MoveTo's own "one grid cell
+        per tick" is ALSO an arbitrary, explicitly-approved granularity
+        choice, not derived from real time/speed -- see this module's own
+        header), so "1 second of Duration = 1 tick" here is the same kind
+        of simplest-possible choice, not a physically-derived one.
+        """
+        return max(1, round(float(self._install_duration_s.get(tool, 10.0))))
+
+    def uninstall_duration_ticks(self, tool):
+        """See install_duration_ticks's own note -- same shape, uninstall's own config key."""
+        return max(1, round(float(self._uninstall_duration_s.get(tool, 10.0))))
+
     def to_cell(self, value_metres):
         return round_position_to_cell(value_metres, self.disc_step_position)
 

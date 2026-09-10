@@ -25,6 +25,11 @@ def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     grid.obstacles_m = obstacles_m  # needed by leaf_library.make_plan_astar's policy precomputation
 
     factory = LeafFactory(config, grid)
+    # Set BEFORE shared_variables()/parse_tree() -- see leaf_library.py's
+    # shared_variables and parse_behavior_tree.uses_tool_actions for why
+    # this can't be decided lazily once an InstallTool/UninstallTool tag
+    # is actually encountered during the tree walk.
+    factory.tool_aware = parse_behavior_tree.uses_tool_actions(xml_path)
     shared_vars = factory.shared_variables()
 
     tree_root = parse_behavior_tree.parse_tree(xml_path, factory)
@@ -33,6 +38,7 @@ def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     goal_code = goal_formula.translate(os.path.join(problem_dir, 'goal_formula.pl'), config, factory, bound=bound)
 
     problem_ir = ir.ProblemIR()
+    problem_ir.enumerations = sorted(factory.enum_atoms)
     problem_ir.constants = [ir.Constant(name, value) for name, value in factory.constants.items()]
     problem_ir.variables = shared_vars + factory.extra_variables
     problem_ir.environment_update = _noise_environment_update(shared_vars)

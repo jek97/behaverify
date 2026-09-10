@@ -37,6 +37,17 @@ no-memory composite already handles natively (see parse_behavior_tree.py),
 with no derived-trigger bookkeeping needed. Battery reaching 0 mid-move is
 still handled inside MoveTo itself, since running out of energy is a
 physical property of the action, not a configurable trigger.
+
+TakeSample/InstallTool/UninstallTool ARE implemented (see make_take_sample/
+make_install_tool/make_uninstall_tool below) -- InstallTool/UninstallTool's
+own `triggers=` port is ignored, same established precedent as MoveTo's.
+The one thing NOT modeled is robot VELOCITY changing while a tool is
+equipped (tool.equipped.<tool>.speed in config.yaml) -- MoveTo already
+ignores config.yaml's own BASE motion.speed entirely (ticks are cells, not
+time -- see parse_config.py's module docstring), so respecting a tool-
+RELATIVE speed change while still ignoring the base value would be
+inconsistent; only the battery-drain-rate side of "battery drain and
+velocity change while equipped" is implemented (_moving_drain_for_hitch).
 """
 from . import astar_policy, ir
 
@@ -89,6 +100,13 @@ class LeafFactory:
         self._obstacle_var_added = False
         self.move_to_aliases = []  # filled in by parse_behavior_tree.collect_move_to_aliases
         self.extra_variables = []  # e.g. obstacle_clearance, appended when first needed
+        self.enum_atoms = set()  # quoted atom literals, e.g. "'free'" -- collected into ProblemIR.enumerations
+        # Set by translator/main.py, BEFORE shared_variables()/parse_tree(),
+        # from parse_behavior_tree.uses_tool_actions -- True iff this
+        # problem's behavior_tree.xml uses InstallTool/UninstallTool
+        # anywhere, which is also when MoveTo needs to be hitch-aware (see
+        # shared_variables/_moving_drain_for_hitch below).
+        self.tool_aware = False
 
         # bounds as constants, reused by every generated leaf
         self.constants['MIN_X'] = grid.min_x
@@ -125,7 +143,36 @@ class LeafFactory:
             ir.Variable('noise_y', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.tangential_noise_support) + '}', initial=_fmt(0)),
             ir.Variable('battery_noise', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.battery_noise_support) + '}', initial=_fmt(0)),
         ]
+        if self.tool_aware:
+            # hitch(free/cart/plow) -- see basic_action_theory.pl's own
+            # hitch/2. A plain persistent fluent (like x/y/battery), not
+            # resampled -- only make_install_tool/make_uninstall_tool's own
+            # coin-flip success ever changes it. Only added when this
+            # problem's tree actually uses InstallTool/UninstallTool, so a
+            # problem that doesn't (e.g. problem4) gets byte-identical
+            # output to before this feature existed.
+            self.enum_atoms.update(["'free'", "'cart'", "'plow'"])
+            variables.append(ir.Variable('hitch', 'bl', 'VAR', "{'free', 'cart', 'plow'}", initial="'free'"))
+            # MoveTo's drain rate WHILE a tool is equipped (tool.equipped.
+            # <tool>.moving_drain_rate) -- see _moving_drain_for_hitch.
+            self.constants['MOVING_DRAIN_CART'] = int(round(self.config.tool_moving_drain_rate['cart']))
+            self.constants['MOVING_DRAIN_PLOW'] = int(round(self.config.tool_moving_drain_rate['plow']))
         return variables
+
+    def _moving_drain_for_hitch(self):
+        """
+        MOVING_DRAIN, but hitch-aware: reads the shared `hitch` fluent
+        (only ever 3 values) via explicit if/eq case dispatch -- NOT
+        `mult` (see squared_distance_condition's own note on why
+        multiplying two variable-derived expressions is the confirmed
+        nuXmv blowup pattern this translator avoids everywhere). Only
+        called when self.tool_aware (see shared_variables) -- a problem
+        that never uses InstallTool/UninstallTool never has `hitch` to
+        read at all, so make_move_to/_make_policy_based_plan fall back to
+        the plain MOVING_DRAIN constant in that case, unchanged from
+        before this feature existed.
+        """
+        return "(if, (eq, hitch, 'cart'), MOVING_DRAIN_CART, (if, (eq, hitch, 'plow'), MOVING_DRAIN_PLOW, MOVING_DRAIN))"
 
     def obstacle_variable(self):
         """Lazily builds the static obstacle-clearance lookup array (only if a
@@ -182,10 +229,14 @@ class LeafFactory:
         # so recomputing the step from `x` here would silently compare the new
         # position against itself.
         is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
-        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
+        moving_drain = self._moving_drain_for_hitch() if self.tool_aware else 'MOVING_DRAIN'
+        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, {drain}, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving, drain=moving_drain)
+        read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise']
+        if self.tool_aware:
+            read_variables.append('hitch')
         action = ir.Action(
             name=name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise'],
+            read_variables=read_variables,
             write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
             updates=[
                 ('var', 'prev_x', 'x'),
@@ -311,10 +362,14 @@ class LeafFactory:
         next_x = '(max, MIN_X, (min, MAX_X, (add, x, (max, -1, (min, 1, (add, {dx}, noise_x))))))'.format(dx=dx_lookup)
         next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, (max, -1, (min, 1, (add, {dy}, noise_y))))))'.format(dy=dy_lookup)
         is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
-        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, MOVING_DRAIN, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving)
+        moving_drain = self._moving_drain_for_hitch() if self.tool_aware else 'MOVING_DRAIN'
+        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, {drain}, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving, drain=moving_drain)
+        read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var]
+        if self.tool_aware:
+            read_variables.append('hitch')
         moveto_action = ir.Action(
             name=moveto_name,
-            read_variables=['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var],
+            read_variables=read_variables,
             write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
             updates=[
                 ('var', 'prev_x', 'x'),
@@ -333,6 +388,166 @@ class LeafFactory:
         )
         self.actions[moveto_name] = moveto_action
         return plan_name, moveto_name
+
+    def make_take_sample(self):
+        """
+        take_sample(ActionCode) in basic_action_theory.pl: instantaneous,
+        like PlanWith -- but UNLIKE every other action, its outcome is a
+        genuine new probabilistic choice (config.yaml's own sample.
+        success_probability), not a deterministic function of the current
+        state. Translated the same way every other probabilistic draw in
+        this model is (noise_x/noise_y/battery_noise) -- as a full
+        nondeterministic choice, not weighted by the actual probability
+        value, since nuXmv's LTL/CTL model checking asks "can this happen"
+        (possibility), not "how likely is this" -- so the exact
+        probability number in config.yaml plays no role here, only
+        WHETHER both outcomes are possible (they always are, barring a
+        literal 0.0 or 1.0 -- not specially handled, since exploring a
+        branch that happens to always come out the same way costs
+        nothing extra, it just never gets exercised).
+
+        Position (x,y) is already global blackboard state and doesn't
+        change during this instantaneous action, so "record the robot's
+        position at the instant of sampling" (the reason port's own
+        sample_success(X,Y,ActionCode)) needs no bookkeeping of its own --
+        x,y already ARE that position for as long as sample_success stays
+        True (see goal_formula.py if a future goal formula needs
+        sample_success_at/3 -- not implemented, no example uses it yet).
+        """
+        name = 'TakeSample'
+        if name in self.actions:
+            return name
+        action = ir.Action(
+            name=name,
+            read_variables=['sample_success'],
+            write_variables=['sample_success'],
+            updates=[
+                ('case_var', 'sample_success', [(None, ['True', 'False'])]),
+            ],
+            return_cases=[
+                ('(eq, sample_success, True)', 'success'),
+                (None, 'failure'),
+            ],
+        )
+        self.actions[name] = action
+        self.extra_variables.append(ir.Variable('sample_success', 'bl', 'VAR', 'BOOLEAN', initial='False'))
+        return name
+
+    _VALID_TOOLS = ('cart', 'plow')
+
+    def make_install_tool(self, tool):
+        if tool not in self._VALID_TOOLS:
+            raise NotImplementedError("InstallTool tool={!r}: only 'cart'/'plow' are accepted.".format(tool))
+        return self._make_tool_action('Install', tool)
+
+    def make_uninstall_tool(self, tool):
+        if tool not in self._VALID_TOOLS:
+            raise NotImplementedError("UninstallTool tool={!r}: only 'cart'/'plow' are accepted.".format(tool))
+        return self._make_tool_action('Uninstall', tool)
+
+    def _make_tool_action(self, kind, tool):
+        """
+        Shared InstallTool/UninstallTool builder -- durative, FIXED-Duration
+        actions (config.yaml's tool.install/uninstall.duration_seconds.
+        <tool>, ROUNDED DIRECTLY to ticks -- see ProblemConfig.
+        install_duration_ticks's own note on why: this translator has no
+        other seconds<->tick conversion anywhere, MoveTo's own "one grid
+        cell per tick" being an equally arbitrary, explicitly-approved
+        choice rather than a physically-derived one).
+
+        Mechanism, mirroring basic_action_theory.pl's own install_tool_leg/
+        uninstall_tool_leg:
+          - precondition (hitch(free) for Install, hitch(tool) for
+            Uninstall) not holding -> immediate failure, state untouched --
+            this action is structurally IMPOSSIBLE from a poss/2 point of
+            view (not a probabilistic failure), and an immediate failure is
+            the closest this return-status-only leaf shape can capture
+            that (can only actually arise from re-entering an already-
+            resolved node, e.g. inside a loop decorator -- see BehaVerify's
+            own support for those in the "repeat until success" question).
+          - battery already at 0 -> failure (the one ALWAYS-on trigger;
+            the `triggers=` port's own EXTRA battery-only halts are out of
+            scope, same precedent as MoveTo's own `triggers=`).
+          - Duration elapses with nothing halting early -> a genuine coin
+            flip (config.yaml's own success_probability, default 0.9),
+            translated to nondeterministic choice exactly like
+            make_take_sample above -- on success, hitch flips (Install:
+            tool; Uninstall: free); on failure, hitch is unchanged, per
+            the theory's own hitch/2 clause.
+          - otherwise -> drain battery at THIS action's own rate
+            (tool.install/uninstall.drain_rate, default idle_drain_rate),
+            increment the elapsed-ticks counter (self-resetting once
+            resolved, same shape as the drift mechanism's own
+            ticks_since_resample), return running.
+        """
+        is_install = kind == 'Install'
+        name = '{}Tool_{}'.format(kind, tool)
+        if name in self.actions:
+            return name
+
+        duration_ticks = (
+            self.config.install_duration_ticks(tool) if is_install
+            else self.config.uninstall_duration_ticks(tool)
+        )
+        drain_rate = int(round(self.config.install_drain_rate if is_install else self.config.uninstall_drain_rate))
+        elapsed_var = '{}_elapsed'.format(name.lower())
+        outcome_var = '{}_outcome'.format(name.lower())
+        # precondition_held/resolved: SNAPSHOTS of the precondition/
+        # duration-elapsed check, captured from hitch/elapsed_var's
+        # PRE-tick values as the FIRST two update statements, then reused
+        # everywhere else in this SAME tick (including return_cases,
+        # which only ever sees POST-update/staged values -- see ir.py's
+        # own note on staging). Without this, return_cases re-deriving
+        # "is the precondition satisfied"/"has duration elapsed" from
+        # hitch/elapsed_var directly would read the NEWLY updated values
+        # instead of the ones this tick's decision was actually based on
+        # -- e.g. a successful install flips hitch away from 'free' in
+        # THIS SAME tick, which would make a freshly-recomputed
+        # precondition check wrongly read as failed. Same idea as
+        # MoveTo's own prev_x/prev_y capture, generalized to booleans.
+        precondition_held_var = '{}_precondition_held'.format(name.lower())
+        resolved_var = '{}_resolved'.format(name.lower())
+        self.extra_variables.append(ir.Variable(elapsed_var, 'bl', 'VAR', '[0, {}]'.format(duration_ticks), initial='0'))
+        self.extra_variables.append(ir.Variable(outcome_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
+        self.extra_variables.append(ir.Variable(precondition_held_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
+        self.extra_variables.append(ir.Variable(resolved_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
+
+        precondition_ok = "(eq, hitch, 'free')" if is_install else "(eq, hitch, '{}')".format(tool)
+        duration_reached = '(gte, {}, {})'.format(elapsed_var, duration_ticks)
+        new_hitch_on_success = "'{}'".format(tool) if is_install else "'free'"
+
+        action = ir.Action(
+            name=name,
+            read_variables=['hitch', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var],
+            write_variables=['hitch', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var],
+            updates=[
+                ('var', precondition_held_var, precondition_ok),
+                ('var', resolved_var, '(and, {}, {})'.format(precondition_held_var, duration_reached)),
+                ('case_var', outcome_var, [
+                    (resolved_var, ['True', 'False']),
+                    (None, [outcome_var]),
+                ]),
+                ('case_var', elapsed_var, [
+                    (resolved_var, ['0']),
+                    (precondition_held_var, ['(add, {}, 1)'.format(elapsed_var)]),
+                    (None, ['0']),
+                ]),
+                ('var', 'battery', '(if, {ok}, (max, 0, (sub, battery, {rate})), battery)'.format(ok=precondition_held_var, rate=drain_rate)),
+                ('case_var', 'hitch', [
+                    ('(and, {}, {})'.format(resolved_var, outcome_var), [new_hitch_on_success]),
+                    (None, ['hitch']),
+                ]),
+            ],
+            return_cases=[
+                ('(not, {})'.format(precondition_held_var), 'failure'),
+                ('(lte, battery, 0)', 'failure'),
+                ('(and, {}, {})'.format(resolved_var, outcome_var), 'success'),
+                (resolved_var, 'failure'),
+                (None, 'running'),
+            ],
+        )
+        self.actions[name] = action
+        return name
 
     # ------------------------------------------------------------------
     # Conditions
