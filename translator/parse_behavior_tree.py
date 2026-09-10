@@ -50,6 +50,30 @@ _COMPOSITE_TAGS = {
     'ReactiveSequence': ('sequence', ''),
 }
 
+_UNROLL_TAGS = {
+    # RetryUntilSuccessful(num_attempts="n")/Repeat(num_cycles="n") --
+    # BT.cpp's own bounded-retry decorators, translated by LITERAL XML
+    # unrolling into n copies of the one child, wired via a plain
+    # Fallback/Sequence (with_partial_memory) -- the SAME translation the
+    # source ProbLog system's own bt_to_prolog.py settled on (see its
+    # "Add RetryUntilSuccessful/Repeat control-flow nodes" commit): this
+    # is a sound 1:1 semantic match, not an approximation --
+    # RetryUntilSuccessful's "first SUCCESS stops, n FAILUREs give up" IS
+    # Fallback's own semantics over n identical children, and Repeat's
+    # "keep going while SUCCEEDING, bail on first FAILURE" IS Sequence's.
+    # No new BehaVerify state or decorator needed -- BehaVerify's own
+    # `repeat` decorator means something different (require n CONSECUTIVE
+    # successes, fail immediately on the first failure -- see
+    # node_creator.py's create_decorator_repeat), so unrolling is the
+    # only way to get true retry-on-failure semantics here.
+    # num_attempts/num_cycles MUST be a literal integer >= 1 -- unrolling
+    # happens once, statically, at translation time, and this translator
+    # has no blackboard/port-reference concept for it to be dynamic in
+    # the first place (see _unroll's own validation).
+    'RetryUntilSuccessful': ('selector', 'num_attempts'),
+    'Repeat': ('sequence', 'num_cycles'),
+}
+
 
 def _parse_point(text):
     x_str, y_str = text.split(';')
@@ -110,6 +134,45 @@ def _build_non_moveto_leaf(tag, attrib, factory):
     raise NotImplementedError('Unrecognized behavior_tree.xml tag: <{}> -- not in schema.yaml\'s vocabulary.'.format(tag))
 
 
+def _unroll(element, factory, path):
+    """
+    <RetryUntilSuccessful num_attempts="N">/<Repeat num_cycles="N"> --
+    exactly one child, unrolled into N copies wired via a plain
+    Fallback/Sequence -- see _UNROLL_TAGS' own note for why this is a
+    sound 1:1 translation, not an approximation.
+    """
+    tag = element.tag
+    node_type, count_attr = _UNROLL_TAGS[tag]
+    if count_attr not in element.attrib:
+        raise ValueError('<{}> is missing its required {}="N" attribute.'.format(tag, count_attr))
+    count_text = element.attrib[count_attr]
+    try:
+        count = int(count_text)
+    except ValueError:
+        raise ValueError(
+            '<{}> {}="{}" must be a literal integer -- unrolling happens once, '
+            'statically, at translation time (no blackboard/port reference is '
+            'possible here).'.format(tag, count_attr, count_text)
+        )
+    if count < 1:
+        raise ValueError('<{}> {}={} must be >= 1.'.format(tag, count_attr, count))
+    children_elements = list(element)
+    if len(children_elements) != 1:
+        raise ValueError('<{}> must have exactly one child (found {}).'.format(tag, len(children_elements)))
+    (child,) = children_elements
+    name = element.attrib.get('name', tag)
+    if count == 1:
+        # BehaVerify's own composite_node grammar rejects a sequence/
+        # selector with fewer than 2 children (check_grammar.py's
+        # walk_tree: "Node ... has less than 2 children") -- and "retry
+        # once"/"repeat once" has no actual retry/repeat behavior to
+        # express anyway, so just translate the one child directly, no
+        # wrapper composite at all.
+        return _walk(child, factory, path + [name])
+    children = [_walk(child, factory, path + [name, 'attempt{}'.format(i)]) for i in range(count)]
+    return ir.TreeNode(kind='composite', node_type=node_type, memory='with_partial_memory', name=name, children=children)
+
+
 def _walk(element, factory, path):
     tag = element.tag
     if tag in _COMPOSITE_TAGS:
@@ -124,7 +187,7 @@ def _walk(element, factory, path):
                 alias = '_'.join(path + [name, 'MoveTo'])
                 children.append(ir.TreeNode(kind='leaf', leaf_kind='action', leaf_ref=moveto_name, name=alias))
                 continue
-            if child.tag in _COMPOSITE_TAGS or child.tag == 'Inverter':
+            if child.tag in _COMPOSITE_TAGS or child.tag == 'Inverter' or child.tag in _UNROLL_TAGS:
                 children.append(_walk(child, factory, path + [name]))
                 continue
             result = _build_non_moveto_leaf(child.tag, child.attrib, factory)
@@ -136,6 +199,8 @@ def _walk(element, factory, path):
             alias = '_'.join(path + [name, child.tag])
             children.append(ir.TreeNode(kind='leaf', leaf_kind=leaf_kind, leaf_ref=leaf_ref, name=alias))
         return ir.TreeNode(kind='composite', node_type=node_type, memory=memory, name=name, children=children)
+    if tag in _UNROLL_TAGS:
+        return _unroll(element, factory, path)
     if tag == 'Inverter':
         raise NotImplementedError('<Inverter> decorator translation is not implemented yet.')
     if tag == 'MoveTo':
@@ -173,6 +238,20 @@ def uses_tool_actions(xml_path):
     """
     tree = ET.parse(xml_path)
     return any(el.tag in ('InstallTool', 'UninstallTool') for el in tree.getroot().iter())
+
+
+def collect_tool_instance_ids(xml_path):
+    """
+    Every distinct `tool="..."` INSTANCE id (not kind -- see
+    leaf_library.py's module docstring on the multi-instance tool
+    feature) referenced by an InstallTool/UninstallTool tag anywhere in
+    the tree. Checked BEFORE shared_variables(), same reason as
+    uses_tool_actions above: the shared `hitch_id` fluent's own domain
+    must enumerate every instance id up front, and shared_variables()
+    only runs once.
+    """
+    tree = ET.parse(xml_path)
+    return {el.attrib['tool'] for el in tree.getroot().iter() if el.tag in ('InstallTool', 'UninstallTool')}
 
 
 def collect_move_to_aliases(tree_node):

@@ -48,6 +48,24 @@ time -- see parse_config.py's module docstring), so respecting a tool-
 RELATIVE speed change while still ignoring the base value would be
 inconsistent; only the battery-drain-rate side of "battery drain and
 velocity change while equipped" is implemented (_moving_drain_for_hitch).
+
+MULTI-INSTANCE TOOLS: a BT's own <InstallTool tool="..."> / <UninstallTool
+tool="..."> names a specific tool INSTANCE id (e.g. "cart1"), not a kind --
+config.yaml's tool.instances maps each id to a kind and a starting
+position (ProblemConfig.tool_instance_kind/tool_instance_start_m).
+Installing requires hitch(free) AND proximity to THIS instance's own
+CURRENT position (tool_position -- see _ensure_tool_position_vars/
+_make_tool_action); uninstalling requires hitch_id(THIS id) specifically
+(hitch_id, not hitch, is the fluent that can tell cart1 from cart2 apart).
+A successful uninstall drops the tool wherever the robot currently is.
+
+RetryUntilSuccessful(num_attempts="n")/Repeat(num_cycles="n") ARE
+implemented in parse_behavior_tree.py, by literal XML unrolling into n
+copies of the one child wired via a plain Fallback/Sequence -- the same
+sound 1:1 translation the source ProbLog system's own bt_to_prolog.py
+uses (see parse_behavior_tree.py's _UNROLL_TAGS for why this isn't an
+approximation, and why BehaVerify's own built-in `repeat` decorator means
+something different and can't be reused for this).
 """
 from . import astar_policy, ir
 
@@ -107,6 +125,19 @@ class LeafFactory:
         # anywhere, which is also when MoveTo needs to be hitch-aware (see
         # shared_variables/_moving_drain_for_hitch below).
         self.tool_aware = False
+        # Set by translator/main.py alongside tool_aware, from
+        # parse_behavior_tree.collect_tool_instance_ids -- every distinct
+        # tool INSTANCE id (e.g. "cart1") the tree's InstallTool/
+        # UninstallTool nodes reference, needed upfront to declare the
+        # shared `hitch_id` fluent's own domain (see shared_variables).
+        self.tool_instance_ids = set()
+        self._tool_position_vars_added = set()  # instance ids whose pos_x/pos_y vars already exist
+        # Set by translator/main.py, BEFORE shared_variables()/parse_tree(),
+        # from goal_formula.collect_ploughed_cells -- every (Cx,Cy) cell a
+        # goal formula's own ploughed/3 conjunct references, needed
+        # upfront so every MoveTo-family action can be wired (see
+        # _ploughed_updates) to track them from the very first one built.
+        self.ploughed_cells = set()
 
         # bounds as constants, reused by every generated leaf
         self.constants['MIN_X'] = grid.min_x
@@ -144,20 +175,79 @@ class LeafFactory:
             ir.Variable('battery_noise', 'env', 'VAR', '{' + ', '.join(str(int(v)) for v in self.config.battery_noise_support) + '}', initial=_fmt(0)),
         ]
         if self.tool_aware:
-            # hitch(free/cart/plow) -- see basic_action_theory.pl's own
-            # hitch/2. A plain persistent fluent (like x/y/battery), not
-            # resampled -- only make_install_tool/make_uninstall_tool's own
-            # coin-flip success ever changes it. Only added when this
-            # problem's tree actually uses InstallTool/UninstallTool, so a
-            # problem that doesn't (e.g. problem4) gets byte-identical
-            # output to before this feature existed.
+            # hitch(free/cart/plow): KIND-level -- see basic_action_
+            # theory.pl's own hitch/2. A plain persistent fluent (like
+            # x/y/battery), not resampled -- only make_install_tool/
+            # make_uninstall_tool's own coin-flip success ever changes
+            # it. Only added when this problem's tree actually uses
+            # InstallTool/UninstallTool, so a problem that doesn't (e.g.
+            # problem4) gets byte-identical output to before this
+            # feature existed.
             self.enum_atoms.update(["'free'", "'cart'", "'plow'"])
             variables.append(ir.Variable('hitch', 'bl', 'VAR', "{'free', 'cart', 'plow'}", initial="'free'"))
+            # hitch_id(free/<every instance id this tree references>):
+            # the INSTANCE-level sibling of hitch, needed to tell "cart1
+            # attached" from "cart2 attached" apart -- specifically for
+            # UninstallTool's own precondition (that SPECIFIC instance
+            # must be the one attached, not just "something of its
+            # kind") and for tool_position's own hitched-exclusion (see
+            # _make_tool_action). Domain is fixed upfront from
+            # self.tool_instance_ids (set by translator/main.py before
+            # this call), same reason tool_aware itself is precomputed.
+            id_atoms = ["'{}'".format(i) for i in sorted(self.tool_instance_ids)]
+            self.enum_atoms.update(id_atoms)
+            self.enum_atoms.add("'free'")
+            variables.append(ir.Variable('hitch_id', 'bl', 'VAR', '{' + ', '.join(["'free'"] + id_atoms) + '}', initial="'free'"))
             # MoveTo's drain rate WHILE a tool is equipped (tool.equipped.
             # <tool>.moving_drain_rate) -- see _moving_drain_for_hitch.
             self.constants['MOVING_DRAIN_CART'] = int(round(self.config.tool_moving_drain_rate['cart']))
             self.constants['MOVING_DRAIN_PLOW'] = int(round(self.config.tool_moving_drain_rate['plow']))
+            # install_tool_range(Range) -- see basic_action_theory.pl's
+            # own poss(start_install_tool(...)); ceil to never let a
+            # real in-range attempt round down and wrongly fail (same
+            # convention _distance_check's own DistanceBelow uses, since
+            # this IS a distance_below check, just embedded in an
+            # action's precondition instead of a standalone Check node).
+            self.constants['INSTALL_RANGE'] = max(1, self.config.to_cells_ceil(self.config.install_range_m))
+            # ploughed_<cx>_<cy>: one persistent boolean per (Cx,Cy) cell
+            # a goal formula's own ploughed/3 conjunct references (see
+            # goal_formula.collect_ploughed_cells/_ploughed_updates) --
+            # empty (no vars added) for a problem whose goal formula
+            # never mentions ploughed/3, same "only pay for what's used"
+            # treatment as everything else in this block.
+            for (cx, cy) in sorted(self.ploughed_cells):
+                variables.append(ir.Variable(self.ploughed_var(cx, cy), 'bl', 'VAR', 'BOOLEAN', initial='False'))
         return variables
+
+    def ploughed_var(self, cx, cy):
+        return 'ploughed_{}_{}'.format(cx, cy).replace('-', 'm')
+
+    def _ploughed_updates(self):
+        """
+        Shared ('case_var', ...) update entries -- one per (Cx,Cy) cell a
+        goal formula's own ploughed/3 conjunct actually references --
+        appended to every MoveTo-family action's own updates, AFTER its
+        own x/y are already staged to their POST-step value. Deliberately
+        NOT a grid-wide writable array: goal_formula.pl only ever asks
+        about a small, FIXED set of specific cells (known at translation
+        time, same as visited/3's own goal points), so a dedicated
+        persistent boolean per referenced cell is both simpler and
+        cheaper than a general array write conditioned on an arbitrary
+        runtime index would be -- and avoids introducing that untested-
+        for-performance pattern into MoveTo's own transition at all. Each
+        check is a plain eq/and over the CURRENT (already-staged) x,y
+        against a COMPILE-TIME CONSTANT cx,cy -- the same cost shape as
+        DistanceBelow's own check, not an array-index lookup.
+        """
+        updates = []
+        for (cx, cy) in sorted(self.ploughed_cells):
+            var_name = self.ploughed_var(cx, cy)
+            condition = "(and, (eq, hitch, 'plow'), (and, (eq, x, {}), (eq, y, {})))".format(cx, cy)
+            updates.append(('case_var', var_name, [
+                (condition, ['True']),
+                (None, [var_name]),
+            ]))
+        return updates
 
     def _moving_drain_for_hitch(self):
         """
@@ -232,12 +322,16 @@ class LeafFactory:
         moving_drain = self._moving_drain_for_hitch() if self.tool_aware else 'MOVING_DRAIN'
         next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, {drain}, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving, drain=moving_drain)
         read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise']
+        write_variables = ['x', 'y', 'prev_x', 'prev_y', 'battery']
         if self.tool_aware:
             read_variables.append('hitch')
+        ploughed_vars = [self.ploughed_var(cx, cy) for (cx, cy) in sorted(self.ploughed_cells)]
+        read_variables += ploughed_vars
+        write_variables += ploughed_vars
         action = ir.Action(
             name=name,
             read_variables=read_variables,
-            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
+            write_variables=write_variables,
             updates=[
                 ('var', 'prev_x', 'x'),
                 ('var', 'prev_y', 'y'),
@@ -249,7 +343,7 @@ class LeafFactory:
                     ('y', next_y),
                     ('battery', next_battery),
                 ]),
-            ],
+            ] + self._ploughed_updates(),
             return_cases=[
                 ('(and, (eq, x, target_x), (eq, y, target_y))', 'success'),
                 ('(lte, battery, 0)', 'failure'),
@@ -365,12 +459,16 @@ class LeafFactory:
         moving_drain = self._moving_drain_for_hitch() if self.tool_aware else 'MOVING_DRAIN'
         next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, {drain}, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving, drain=moving_drain)
         read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var]
+        write_variables = ['x', 'y', 'prev_x', 'prev_y', 'battery']
         if self.tool_aware:
             read_variables.append('hitch')
+        ploughed_vars = [self.ploughed_var(cx, cy) for (cx, cy) in sorted(self.ploughed_cells)]
+        read_variables += ploughed_vars
+        write_variables += ploughed_vars
         moveto_action = ir.Action(
             name=moveto_name,
             read_variables=read_variables,
-            write_variables=['x', 'y', 'prev_x', 'prev_y', 'battery'],
+            write_variables=write_variables,
             updates=[
                 ('var', 'prev_x', 'x'),
                 ('var', 'prev_y', 'y'),
@@ -379,7 +477,7 @@ class LeafFactory:
                     ('y', next_y),
                     ('battery', next_battery),
                 ]),
-            ],
+            ] + self._ploughed_updates(),
             return_cases=[
                 ('(and, (eq, x, target_x), (eq, y, target_y))', 'success'),
                 ('(lte, battery, 0)', 'failure'),
@@ -433,78 +531,141 @@ class LeafFactory:
         self.extra_variables.append(ir.Variable('sample_success', 'bl', 'VAR', 'BOOLEAN', initial='False'))
         return name
 
-    _VALID_TOOLS = ('cart', 'plow')
+    def make_install_tool(self, tool_id):
+        return self._make_tool_action('Install', tool_id)
 
-    def make_install_tool(self, tool):
-        if tool not in self._VALID_TOOLS:
-            raise NotImplementedError("InstallTool tool={!r}: only 'cart'/'plow' are accepted.".format(tool))
-        return self._make_tool_action('Install', tool)
+    def make_uninstall_tool(self, tool_id):
+        return self._make_tool_action('Uninstall', tool_id)
 
-    def make_uninstall_tool(self, tool):
-        if tool not in self._VALID_TOOLS:
-            raise NotImplementedError("UninstallTool tool={!r}: only 'cart'/'plow' are accepted.".format(tool))
-        return self._make_tool_action('Uninstall', tool)
+    def _ensure_tool_position_vars(self, tool_id):
+        """
+        Lazily builds this tool INSTANCE's own persistent (pos_x, pos_y)
+        -- basic_action_theory.pl's own tool_position/4, seeded from
+        config.yaml's tool.instances[].x/y and updated (see
+        _make_tool_action) only on a SUCCESSFUL uninstall of THIS id, to
+        wherever the robot actually was at that moment. Shared between an
+        id's own InstallTool_<id> (reads it, for the proximity
+        precondition) and UninstallTool_<id> (reads AND writes it) --
+        added once regardless of which one is built first.
+        """
+        if tool_id in self._tool_position_vars_added:
+            return
+        self._tool_position_vars_added.add(tool_id)
+        if tool_id not in self.config.tool_instance_start_m:
+            raise NotImplementedError(
+                'InstallTool/UninstallTool tool={!r}: no tool.instances entry in '
+                "config.yaml for this id -- every instance id a tree's InstallTool/"
+                'UninstallTool nodes reference needs its own {{id,kind,x,y}} entry '
+                'under tool.instances.'.format(tool_id)
+            )
+        start_x_m, start_y_m = self.config.tool_instance_start_m[tool_id]
+        sx, sy = self.config.to_cell(start_x_m), self.config.to_cell(start_y_m)
+        self.extra_variables.append(ir.Variable(self._tool_pos_x_var(tool_id), 'bl', 'VAR', '[MIN_X, MAX_X]', initial=_fmt(sx)))
+        self.extra_variables.append(ir.Variable(self._tool_pos_y_var(tool_id), 'bl', 'VAR', '[MIN_Y, MAX_Y]', initial=_fmt(sy)))
 
-    def _make_tool_action(self, kind, tool):
+    @staticmethod
+    def _tool_pos_x_var(tool_id):
+        return '{}_pos_x'.format(tool_id)
+
+    @staticmethod
+    def _tool_pos_y_var(tool_id):
+        return '{}_pos_y'.format(tool_id)
+
+    def _make_tool_action(self, action_kind, tool_id):
         """
         Shared InstallTool/UninstallTool builder -- durative, FIXED-Duration
         actions (config.yaml's tool.install/uninstall.duration_seconds.
-        <tool>, ROUNDED DIRECTLY to ticks -- see ProblemConfig.
+        <kind>, ROUNDED DIRECTLY to ticks -- see ProblemConfig.
         install_duration_ticks's own note on why: this translator has no
         other seconds<->tick conversion anywhere, MoveTo's own "one grid
         cell per tick" being an equally arbitrary, explicitly-approved
         choice rather than a physically-derived one).
 
+        `tool_id` names a specific tool INSTANCE (e.g. "cart1"), not a
+        kind -- config.yaml's tool.instances maps each id to a kind and a
+        starting position (see _ensure_tool_position_vars/
+        ProblemConfig.tool_instance_kind); an id with no such entry is a
+        clear translation-time error, not a silent default (mirrors
+        config_to_prolog.py's own validation, just done earlier -- this
+        translator DOES parse config.yaml, unlike bt_to_prolog.py, so
+        there's no reason to defer the check to a runtime Prolog failure
+        the way that file has to).
+
         Mechanism, mirroring basic_action_theory.pl's own install_tool_leg/
         uninstall_tool_leg:
-          - precondition (hitch(free) for Install, hitch(tool) for
-            Uninstall) not holding -> immediate failure, state untouched --
-            this action is structurally IMPOSSIBLE from a poss/2 point of
-            view (not a probabilistic failure), and an immediate failure is
-            the closest this return-status-only leaf shape can capture
-            that (can only actually arise from re-entering an already-
-            resolved node, e.g. inside a loop decorator -- see BehaVerify's
-            own support for those in the "repeat until success" question).
+          - precondition not holding -> immediate failure, state
+            untouched -- this action is structurally IMPOSSIBLE from a
+            poss/2 point of view (not a probabilistic failure), and an
+            immediate failure is the closest this return-status-only leaf
+            shape can capture that (can only actually arise from
+            re-entering an already-resolved node, e.g. inside
+            RetryUntilSuccessful/Repeat). Install's own precondition is
+            hitch(free) AND proximity to THIS instance's own CURRENT
+            tool_position (within INSTALL_RANGE, config.yaml's tool.
+            install.range) -- reusing the same Chebyshev-distance
+            primitive DistanceBelow's own check uses, just between two
+            VARIABLE pairs (x,y vs this id's own pos_x/pos_y) instead of
+            a compile-time-constant goal; still only sub/abs/max, no
+            `mult` of two variable-derived expressions, so this doesn't
+            reintroduce the confirmed nuXmv blowup pattern (see
+            squared_distance_condition's own note). Uninstall's own
+            precondition is hitch_id(THIS id) -- not just hitch(kind) --
+            since only hitch_id can tell "cart1 attached" from "cart2
+            attached" apart.
           - battery already at 0 -> failure (the one ALWAYS-on trigger;
             the `triggers=` port's own EXTRA battery-only halts are out of
             scope, same precedent as MoveTo's own `triggers=`).
           - Duration elapses with nothing halting early -> a genuine coin
             flip (config.yaml's own success_probability, default 0.9),
             translated to nondeterministic choice exactly like
-            make_take_sample above -- on success, hitch flips (Install:
-            tool; Uninstall: free); on failure, hitch is unchanged, per
-            the theory's own hitch/2 clause.
+            make_take_sample above -- on success, hitch (KIND) and
+            hitch_id (INSTANCE) both flip (Install: this id/its kind;
+            Uninstall: free/free), and -- uninstall only -- this id's own
+            tool_position updates to wherever the robot currently is
+            (dropped there); on failure, all three are unchanged, per the
+            theory's own hitch/2/hitch_id/2/tool_position/4 clauses.
           - otherwise -> drain battery at THIS action's own rate
             (tool.install/uninstall.drain_rate, default idle_drain_rate),
             increment the elapsed-ticks counter (self-resetting once
             resolved, same shape as the drift mechanism's own
             ticks_since_resample), return running.
         """
-        is_install = kind == 'Install'
-        name = '{}Tool_{}'.format(kind, tool)
+        is_install = action_kind == 'Install'
+        name = '{}Tool_{}'.format(action_kind, tool_id)
         if name in self.actions:
             return name
+        if tool_id not in self.config.tool_instance_kind:
+            raise NotImplementedError(
+                '{}Tool tool={!r}: no tool.instances entry in config.yaml for this '
+                "id -- every instance id a tree's InstallTool/UninstallTool nodes "
+                'reference needs its own {{id,kind,x,y}} entry under '
+                'tool.instances.'.format(action_kind, tool_id)
+            )
+        tool_kind = self.config.tool_instance_kind[tool_id]  # 'cart'/'plow', resolved at translation time
+        self._ensure_tool_position_vars(tool_id)
+        pos_x_var = self._tool_pos_x_var(tool_id)
+        pos_y_var = self._tool_pos_y_var(tool_id)
 
         duration_ticks = (
-            self.config.install_duration_ticks(tool) if is_install
-            else self.config.uninstall_duration_ticks(tool)
+            self.config.install_duration_ticks(tool_kind) if is_install
+            else self.config.uninstall_duration_ticks(tool_kind)
         )
         drain_rate = int(round(self.config.install_drain_rate if is_install else self.config.uninstall_drain_rate))
         elapsed_var = '{}_elapsed'.format(name.lower())
         outcome_var = '{}_outcome'.format(name.lower())
         # precondition_held/resolved: SNAPSHOTS of the precondition/
-        # duration-elapsed check, captured from hitch/elapsed_var's
+        # duration-elapsed check, captured from hitch/hitch_id/elapsed_var's
         # PRE-tick values as the FIRST two update statements, then reused
         # everywhere else in this SAME tick (including return_cases,
         # which only ever sees POST-update/staged values -- see ir.py's
         # own note on staging). Without this, return_cases re-deriving
         # "is the precondition satisfied"/"has duration elapsed" from
-        # hitch/elapsed_var directly would read the NEWLY updated values
-        # instead of the ones this tick's decision was actually based on
-        # -- e.g. a successful install flips hitch away from 'free' in
-        # THIS SAME tick, which would make a freshly-recomputed
-        # precondition check wrongly read as failed. Same idea as
-        # MoveTo's own prev_x/prev_y capture, generalized to booleans.
+        # hitch/hitch_id/elapsed_var directly would read the NEWLY updated
+        # values instead of the ones this tick's decision was actually
+        # based on -- e.g. a successful install flips hitch/hitch_id away
+        # from free in THIS SAME tick, which would make a freshly-
+        # recomputed precondition check wrongly read as failed. Same idea
+        # as MoveTo's own prev_x/prev_y capture, generalized to booleans.
         precondition_held_var = '{}_precondition_held'.format(name.lower())
         resolved_var = '{}_resolved'.format(name.lower())
         self.extra_variables.append(ir.Variable(elapsed_var, 'bl', 'VAR', '[0, {}]'.format(duration_ticks), initial='0'))
@@ -512,36 +673,56 @@ class LeafFactory:
         self.extra_variables.append(ir.Variable(precondition_held_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
         self.extra_variables.append(ir.Variable(resolved_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
 
-        precondition_ok = "(eq, hitch, 'free')" if is_install else "(eq, hitch, '{}')".format(tool)
+        if is_install:
+            proximity_ok = squared_distance_condition('x', 'y', pos_x_var, pos_y_var, 'INSTALL_RANGE', 'lt')
+            precondition_ok = "(and, (eq, hitch, 'free'), {})".format(proximity_ok)
+        else:
+            precondition_ok = "(eq, hitch_id, '{}')".format(tool_id)
         duration_reached = '(gte, {}, {})'.format(elapsed_var, duration_ticks)
-        new_hitch_on_success = "'{}'".format(tool) if is_install else "'free'"
+        new_hitch_on_success = "'{}'".format(tool_kind) if is_install else "'free'"
+        new_hitch_id_on_success = "'{}'".format(tool_id) if is_install else "'free'"
+        resolved_and_succeeded = '(and, {}, {})'.format(resolved_var, outcome_var)
+
+        updates = [
+            ('var', precondition_held_var, precondition_ok),
+            ('var', resolved_var, '(and, {}, {})'.format(precondition_held_var, duration_reached)),
+            ('case_var', outcome_var, [
+                (resolved_var, ['True', 'False']),
+                (None, [outcome_var]),
+            ]),
+            ('case_var', elapsed_var, [
+                (resolved_var, ['0']),
+                (precondition_held_var, ['(add, {}, 1)'.format(elapsed_var)]),
+                (None, ['0']),
+            ]),
+            ('var', 'battery', '(if, {ok}, (max, 0, (sub, battery, {rate})), battery)'.format(ok=precondition_held_var, rate=drain_rate)),
+            ('case_var', 'hitch', [
+                (resolved_and_succeeded, [new_hitch_on_success]),
+                (None, ['hitch']),
+            ]),
+            ('case_var', 'hitch_id', [
+                (resolved_and_succeeded, [new_hitch_id_on_success]),
+                (None, ['hitch_id']),
+            ]),
+        ]
+        write_variables = ['hitch', 'hitch_id', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var]
+        if not is_install:
+            # a successful uninstall drops the tool wherever the robot
+            # currently is -- tool_position(Id,GX,GY,do(halt_uninstall_
+            # tool(...,uninstall_tool_success(Id,_),true),S)) :- at(GX,GY,T,S).
+            updates.append(('case_var', pos_x_var, [(resolved_and_succeeded, ['x']), (None, [pos_x_var])]))
+            updates.append(('case_var', pos_y_var, [(resolved_and_succeeded, ['y']), (None, [pos_y_var])]))
+            write_variables += [pos_x_var, pos_y_var]
 
         action = ir.Action(
             name=name,
-            read_variables=['hitch', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var],
-            write_variables=['hitch', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var],
-            updates=[
-                ('var', precondition_held_var, precondition_ok),
-                ('var', resolved_var, '(and, {}, {})'.format(precondition_held_var, duration_reached)),
-                ('case_var', outcome_var, [
-                    (resolved_var, ['True', 'False']),
-                    (None, [outcome_var]),
-                ]),
-                ('case_var', elapsed_var, [
-                    (resolved_var, ['0']),
-                    (precondition_held_var, ['(add, {}, 1)'.format(elapsed_var)]),
-                    (None, ['0']),
-                ]),
-                ('var', 'battery', '(if, {ok}, (max, 0, (sub, battery, {rate})), battery)'.format(ok=precondition_held_var, rate=drain_rate)),
-                ('case_var', 'hitch', [
-                    ('(and, {}, {})'.format(resolved_var, outcome_var), [new_hitch_on_success]),
-                    (None, ['hitch']),
-                ]),
-            ],
+            read_variables=['hitch', 'hitch_id', 'battery', 'x', 'y', pos_x_var, pos_y_var, elapsed_var, outcome_var, precondition_held_var, resolved_var],
+            write_variables=write_variables,
+            updates=updates,
             return_cases=[
                 ('(not, {})'.format(precondition_held_var), 'failure'),
                 ('(lte, battery, 0)', 'failure'),
-                ('(and, {}, {})'.format(resolved_var, outcome_var), 'success'),
+                (resolved_and_succeeded, 'success'),
                 (resolved_var, 'failure'),
                 (None, 'running'),
             ],

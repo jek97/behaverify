@@ -122,22 +122,63 @@ class ProblemConfig:
             for tool in ('cart', 'plow')
         }
 
-    def install_duration_ticks(self, tool):
+        # ------------------------------------------------------------
+        # Multi-instance tools -- a BT's own <InstallTool tool="..."> /
+        # <UninstallTool tool="..."> now names a specific tool INSTANCE
+        # id (e.g. "cart1"), not a kind; multiple instances of the same
+        # kind can exist, each with its own starting position. Mirrors
+        # config_to_prolog.py's own tool.instances shape exactly:
+        #   tool:
+        #     instances:
+        #       - {id: cart1, kind: cart, x: 3.0, y: 2.075}
+        # OPTIONAL: a problem whose tree never installs anything needs no
+        # tool.instances at all (leaf_library.py only ever looks up an id
+        # that a BT actually references, and raises a clear error there
+        # if it's missing -- see tool_instance_kind/tool_instance_start_m).
+        # ------------------------------------------------------------
+        self.tool_instance_kind = {}
+        self.tool_instance_start_m = {}
+        for entry in tool_cfg.get('instances', []):
+            tool_id = str(entry['id'])
+            kind = str(entry['kind'])
+            if kind not in ('cart', 'plow'):
+                raise NotImplementedError(
+                    "tool.instances entry {!r} has kind {!r} -- only 'cart'/'plow' "
+                    'are supported.'.format(tool_id, kind)
+                )
+            self.tool_instance_kind[tool_id] = kind
+            self.tool_instance_start_m[tool_id] = (float(entry['x']), float(entry['y']))
+
+        # tool.install.range -- how close (metres) the robot's CURRENT
+        # position must be to a tool instance's own tool_position before
+        # InstallTool can start (basic_action_theory.pl reuses holds(
+        # distance_below(GX,GY,Range),S) directly for this). ONE value,
+        # not per-tool (matching install_drain_rate's own "specific to
+        # the ACTION, not the tool" shape), defaulting to safety_margin
+        # (robot_radius+safety_buffer) -- "close enough that the robot's
+        # own body reaches it" is the least arbitrary default available
+        # without a real robot/tool geometry model.
+        self.install_range_m = float(install_cfg.get('range', self.safety_margin))
+
+    def install_duration_ticks(self, kind):
         """
-        config.yaml's tool.install.duration_seconds.<tool> (default 10s,
+        config.yaml's tool.install.duration_seconds.<kind> (default 10s,
         matching config_to_prolog.py's own _DEFAULT_TOOL_DURATION_S),
         rounded DIRECTLY to ticks -- this translator has no other
         seconds<->tick conversion anywhere (MoveTo's own "one grid cell
         per tick" is ALSO an arbitrary, explicitly-approved granularity
         choice, not derived from real time/speed -- see this module's own
         header), so "1 second of Duration = 1 tick" here is the same kind
-        of simplest-possible choice, not a physically-derived one.
+        of simplest-possible choice, not a physically-derived one. Keyed
+        by KIND (duration is per-kind, not per-instance -- every cart
+        takes the same time to install) -- callers resolve an instance id
+        to its kind via tool_instance_kind first.
         """
-        return max(1, round(float(self._install_duration_s.get(tool, 10.0))))
+        return max(1, round(float(self._install_duration_s.get(kind, 10.0))))
 
-    def uninstall_duration_ticks(self, tool):
+    def uninstall_duration_ticks(self, kind):
         """See install_duration_ticks's own note -- same shape, uninstall's own config key."""
-        return max(1, round(float(self._uninstall_duration_s.get(tool, 10.0))))
+        return max(1, round(float(self._uninstall_duration_s.get(kind, 10.0))))
 
     def to_cell(self, value_metres):
         return round_position_to_cell(value_metres, self.disc_step_position)

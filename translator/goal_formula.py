@@ -170,6 +170,71 @@ def _translate_visited(args, config, _factory, situation_var, bound):
     return _wrap_finally(condition, bound)
 
 
+def _translate_sample_success_at(args, config, _factory, situation_var, bound):
+    # sample_success_at/3: sample_success_at(Loc, Tol, S) -- see
+    # basic_action_theory.pl's own sample_success_at/3: TRUE iff SOME
+    # take_sample action SUCCEEDED, anywhere in S's history, at a
+    # recorded position within Tol of Loc. `sample_success` (leaf_
+    # library.make_take_sample) is resampled fresh every time TakeSample
+    # runs, so unlike visited/3's own x/y (which freeze once a walk
+    # completes) it does NOT stay True forever after one success -- but
+    # that's fine: LTL's `finally` already does the "true at ANY point
+    # in history" search on its own, so we only need to check "is
+    # sample_success True AND is the robot's CURRENT position (x,y) --
+    # unchanged since TakeSample is instantaneous -- at Loc" at the
+    # SAME instant, exactly like visited/3's own exact-equality
+    # simplification (Tol is validated but not used arithmetically, for
+    # the identical reason: this grid's positions are already exact
+    # cells, so exact equality is equivalent to any Tol>=1 cell here).
+    loc, tol, s = args
+    if s != ('var', situation_var):
+        raise NotImplementedError("sample_success_at/3's own situation argument must be goal_formula's own S.")
+    if tol[0] != 'num':
+        raise NotImplementedError('sample_success_at/3\'s own Tol argument must be a literal number, found: {}'.format(tol))
+    x_m, y_m = _require_point(loc)
+    cx, cy = config.to_cell(x_m), config.to_cell(y_m)
+    condition = '(and, sample_success, (and, (eq, x, {}), (eq, y, {})))'.format(cx, cy)
+    return _wrap_finally(condition, bound)
+
+
+def _translate_ploughed(args, _config, factory, situation_var, bound):
+    # ploughed/3: ploughed(Cx, Cy, S) -- see basic_action_theory.pl's own
+    # ploughed/3: TRUE iff macro-cell (Cx,Cy) was swept by the robot's
+    # path while the plow was equipped, anywhere in S's history. The
+    # source theory uses its OWN, separately-configurable macro-cell
+    # grid (config.yaml's ploughing.cell_size, decoupled from disc_step_
+    # position) -- this translator does NOT: Cx,Cy here are interpreted
+    # DIRECTLY as this translator's own grid-cell coordinates (same
+    # units as x/y, target_x/target_y, ...), per an explicit simplifying
+    # choice (this project already works on a grid; reuse ITS spacing
+    # rather than introduce a second, independent one). One consequence:
+    # a real ploughing.cell_size coarser than disc_step_position would
+    # let a single real pass plough a whole neighborhood of macro-cells
+    # at once, whereas this translation only ever marks the exact cell
+    # the robot's discrete path actually occupies -- an honest, coarser-
+    # grained approximation, not a systematic bias.
+    #
+    # Tracking mechanism (leaf_library.LeafFactory._ploughed_updates):
+    # a DEDICATED persistent boolean per (Cx,Cy) pair actually referenced
+    # here (not a grid-wide writable array -- goal_formula.pl only ever
+    # asks about a small, fixed set of specific cells, known at
+    # translation time, same as visited/3's own goal points), updated by
+    # every MoveTo-family action via a plain eq/and check against the
+    # CURRENT (post-step) x,y -- see collect_ploughed_cells, which this
+    # module's own translate() calls up front, BEFORE any MoveTo action
+    # is built, so that tracking can be wired into it from the start.
+    cx_term, cy_term, s = args
+    if s != ('var', situation_var):
+        raise NotImplementedError("ploughed/3's own situation argument must be goal_formula's own S.")
+    if cx_term[0] != 'num' or cy_term[0] != 'num':
+        raise NotImplementedError(
+            "ploughed/3's Cx,Cy must be literal integers (this translator's own grid-cell units)."
+        )
+    cx, cy = int(cx_term[1]), int(cy_term[1])
+    var_name = factory.ploughed_var(cx, cy)
+    return _wrap_finally('(eq, {}, True)'.format(var_name), bound)
+
+
 def _translate_battery_depleted_in(args, _config, factory, situation_var, bound):
     (s,) = args
     if s != ('var', situation_var):
@@ -187,7 +252,32 @@ def _translate_battery_depleted_in(args, _config, factory, situation_var, bound)
 _DISPATCH = {
     ('visited', 3): _translate_visited,
     ('battery_depleted_in', 1): _translate_battery_depleted_in,
+    ('sample_success_at', 3): _translate_sample_success_at,
+    ('ploughed', 3): _translate_ploughed,
 }
+
+
+def collect_ploughed_cells(path):
+    """
+    Every distinct (Cx,Cy) cell any ploughed/3 conjunct in goal_formula.pl
+    references -- called BEFORE parse_behavior_tree.parse_tree() builds
+    any MoveTo action, so LeafFactory.ploughed_cells can be set up front
+    and every MoveTo-family action's own updates can be wired to track
+    them from the start (see leaf_library.LeafFactory._ploughed_updates
+    and _translate_ploughed's own note on why this can't be decided
+    lazily during translate() the way _DISPATCH normally works).
+    """
+    _situation_var, conjuncts = parse_goal_formula(path)
+    cells = set()
+    for term in conjuncts:
+        if term[0] == 'compound' and term[1] == 'ploughed' and len(term[2]) == 3:
+            cx_term, cy_term, _s = term[2]
+            if cx_term[0] != 'num' or cy_term[0] != 'num':
+                raise NotImplementedError(
+                    "ploughed/3's Cx,Cy must be literal integers (this translator's own grid-cell units)."
+                )
+            cells.add((int(cx_term[1]), int(cy_term[1])))
+    return cells
 
 
 def translate(path, config, factory, bound=None):

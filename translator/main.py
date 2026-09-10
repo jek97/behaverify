@@ -29,7 +29,13 @@ def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     # shared_variables and parse_behavior_tree.uses_tool_actions for why
     # this can't be decided lazily once an InstallTool/UninstallTool tag
     # is actually encountered during the tree walk.
-    factory.tool_aware = parse_behavior_tree.uses_tool_actions(xml_path)
+    factory.ploughed_cells = goal_formula.collect_ploughed_cells(os.path.join(problem_dir, 'goal_formula.pl'))
+    # ploughed/3 inherently needs `hitch` (it only ever fires while
+    # hitch=='plow') -- force hitch-awareness even for the (unusual, but
+    # not invalid) case of a goal formula mentioning ploughed/3 without
+    # the tree itself containing an InstallTool/UninstallTool node.
+    factory.tool_aware = parse_behavior_tree.uses_tool_actions(xml_path) or bool(factory.ploughed_cells)
+    factory.tool_instance_ids = parse_behavior_tree.collect_tool_instance_ids(xml_path)
     shared_vars = factory.shared_variables()
 
     tree_root = parse_behavior_tree.parse_tree(xml_path, factory)
