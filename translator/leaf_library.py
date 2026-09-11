@@ -149,6 +149,14 @@ class LeafFactory:
         # upfront so every MoveTo-family action can be wired (see
         # _ploughed_updates) to track them from the very first one built.
         self.ploughed_cells = set()
+        # Populated incrementally by make_take_sample as the tree is
+        # walked -- every distinct TakeSample id built so far. Read by
+        # goal_formula.py's sample_success_at/3 translation (runs AFTER
+        # parse_tree(), so this is always complete by then) to OR across
+        # every id's own sample_success_<id>/sample_pos_x_<id>/
+        # sample_pos_y_<id>, since sample_success_at/3 itself carries no
+        # id argument -- it means "did ANY take_sample succeed near Loc".
+        self.sample_ids = set()
 
         # bounds as constants, reused by every generated leaf
         self.constants['MIN_X'] = grid.min_x
@@ -535,6 +543,14 @@ class LeafFactory:
     def sample_value_var(sample_id):
         return 'sample_value_{}'.format(sample_id)
 
+    @staticmethod
+    def sample_pos_x_var(sample_id):
+        return 'sample_pos_x_{}'.format(sample_id)
+
+    @staticmethod
+    def sample_pos_y_var(sample_id):
+        return 'sample_pos_y_{}'.format(sample_id)
+
     def make_take_sample(self, sample_id):
         """
         take_sample(ActionCode) in basic_action_theory.pl: instantaneous,
@@ -565,23 +581,36 @@ class LeafFactory:
         the parameters that make different occurrences actually
         different" idiom PlanStraight_<gx>_<gy> already uses.
 
-        Position (x,y) is already global blackboard state and doesn't
-        change during this instantaneous action, so "record the robot's
-        position at the instant of sampling" (the reason port's own
-        sample_success(X,Y,V,SampleId,ActionCode)) needs no bookkeeping
-        of its own -- x,y already ARE that position for as long as
-        sample_success_<id> stays True (see goal_formula.py's
-        sample_success_at/3).
+        Position (x,y) is global blackboard state that MOVES between
+        different TakeSample occurrences (a tree can have several,
+        each with its own id) -- so "record the robot's position at
+        the instant of sampling" (the reason port's own sample_success
+        (X,Y,V,SampleId,ActionCode)) DOES need its own bookkeeping now,
+        unlike the single-shared-TakeSample design this replaced: a
+        dedicated sample_pos_x_<id>/sample_pos_y_<id> pair, captured
+        (same staging trick as success_var/value_var -- reads success_
+        var's own just-staged value) ONLY at the moment success_var
+        becomes True, and held afterward. Without this, goal_formula.
+        py's sample_success_at/3 checking "is sample_success_<id> True
+        AND is the CURRENT x,y at Loc" would misfire for any id whose
+        success happened at an EARLIER position the robot has since
+        moved away from (sample_success_<id> stays True long after
+        that tick, but x,y no longer matches where it actually
+        succeeded).
         """
         name = 'TakeSample_{}'.format(sample_id)
         if name in self.actions:
             return name
+        self.sample_ids.add(sample_id)
         success_var = self.sample_success_var(sample_id)
         value_var = self.sample_value_var(sample_id)
+        pos_x_var = self.sample_pos_x_var(sample_id)
+        pos_y_var = self.sample_pos_y_var(sample_id)
+        sx, sy = self.config.start_cell
         action = ir.Action(
             name=name,
-            read_variables=[success_var, value_var],
-            write_variables=[success_var, value_var],
+            read_variables=[success_var, value_var, pos_x_var, pos_y_var, 'x', 'y'],
+            write_variables=[success_var, value_var, pos_x_var, pos_y_var],
             updates=[
                 ('case_var', success_var, [(None, ['True', 'False'])]),
                 # value is drawn ONLY on success (reads success_var's OWN
@@ -597,6 +626,8 @@ class LeafFactory:
                     (success_var, [str(v) for v in range(11)]),
                     (None, [value_var]),
                 ]),
+                ('case_var', pos_x_var, [(success_var, ['x']), (None, [pos_x_var])]),
+                ('case_var', pos_y_var, [(success_var, ['y']), (None, [pos_y_var])]),
             ],
             return_cases=[
                 ('(eq, {}, True)'.format(success_var), 'success'),
@@ -606,6 +637,8 @@ class LeafFactory:
         self.actions[name] = action
         self.extra_variables.append(ir.Variable(success_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
         self.extra_variables.append(ir.Variable(value_var, 'bl', 'VAR', '[0, 10]', initial='0'))
+        self.extra_variables.append(ir.Variable(pos_x_var, 'bl', 'VAR', '[MIN_X, MAX_X]', initial=_fmt(sx)))
+        self.extra_variables.append(ir.Variable(pos_y_var, 'bl', 'VAR', '[MIN_Y, MAX_Y]', initial=_fmt(sy)))
         return name
 
     def make_install_tool(self, tool_id):

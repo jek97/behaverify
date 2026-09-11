@@ -195,7 +195,19 @@ def _walk(element, factory, path):
     tag = element.tag
     if tag in _COMPOSITE_TAGS:
         node_type, memory = _COMPOSITE_TAGS[tag]
-        name = element.attrib.get('name', tag)
+        # Path-qualified default name (not just the bare tag), same
+        # reasoning as _unroll's own name default just below -- at the
+        # tree ROOT (path == []) this is identical to the bare tag, so
+        # existing trees whose root composite has no explicit name= are
+        # completely unaffected; the fix only changes anything for an
+        # UNNAMED composite NESTED under another node, which is exactly
+        # the case that can otherwise collide (BehaVerify's own
+        # check_grammar.py requires every composite/leaf name to be
+        # globally unique) -- e.g. two sibling <Sequence> elements, or a
+        # <Sequence> wrapped in an unnamed <RetryUntilSuccessful>, both
+        # of which previously computed their OWN name as the bare tag
+        # regardless of where they sat in the tree.
+        name = element.attrib.get('name', '_'.join(path + [tag]))
         children = []
         pending_moveto = None  # set by the most recent PlanWith sibling, consumed by the next MoveTo
         # child_tag_occurrence: disambiguates multiple UNNAMED siblings of

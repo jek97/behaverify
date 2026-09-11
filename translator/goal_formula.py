@@ -170,22 +170,32 @@ def _translate_visited(args, config, _factory, situation_var, bound):
     return _wrap_finally(condition, bound)
 
 
-def _translate_sample_success_at(args, config, _factory, situation_var, bound):
+def _translate_sample_success_at(args, config, factory, situation_var, bound):
     # sample_success_at/3: sample_success_at(Loc, Tol, S) -- see
     # basic_action_theory.pl's own sample_success_at/3: TRUE iff SOME
-    # take_sample action SUCCEEDED, anywhere in S's history, at a
-    # recorded position within Tol of Loc. `sample_success` (leaf_
-    # library.make_take_sample) is resampled fresh every time TakeSample
-    # runs, so unlike visited/3's own x/y (which freeze once a walk
-    # completes) it does NOT stay True forever after one success -- but
-    # that's fine: LTL's `finally` already does the "true at ANY point
-    # in history" search on its own, so we only need to check "is
-    # sample_success True AND is the robot's CURRENT position (x,y) --
-    # unchanged since TakeSample is instantaneous -- at Loc" at the
-    # SAME instant, exactly like visited/3's own exact-equality
-    # simplification (Tol is validated but not used arithmetically, for
-    # the identical reason: this grid's positions are already exact
-    # cells, so exact equality is equivalent to any Tol>=1 cell here).
+    # take_sample action (ANY id -- this predicate carries no SampleId
+    # argument, unlike sample_value_below/equal/over/3) SUCCEEDED,
+    # anywhere in S's history, at a recorded position within Tol of Loc.
+    #
+    # A tree can have SEVERAL TakeSample occurrences (each its own id),
+    # and the robot MOVES between them -- so this can't just check "is
+    # ANY sample_success_<id> currently True AND does the robot's
+    # CURRENT x,y match Loc": sample_success_<id> stays True long after
+    # that id's own success (until that SAME id's TakeSample runs
+    # again), but the robot could easily have moved elsewhere since,
+    # making current x,y no longer where THAT success actually happened.
+    # leaf_library.make_take_sample captures the position AT THE MOMENT
+    # of success into its own sample_pos_x_<id>/sample_pos_y_<id> pair
+    # for exactly this reason -- so the real check, per id, is
+    # "sample_success_<id> AND sample_pos_x_<id>==cx AND sample_pos_y_
+    # <id>==cy", ORed across every id the tree actually uses
+    # (factory.sample_ids, populated by make_take_sample during
+    # parse_tree(), which always runs before this translation step).
+    # Same exact-equality simplification as visited/3 (Tol is validated
+    # but not used arithmetically -- this grid's positions are already
+    # exact cells, so exact equality is equivalent to any Tol>=1 cell
+    # here); LTL's `finally` does the "true at ANY point in history"
+    # search on its own.
     loc, tol, s = args
     if s != ('var', situation_var):
         raise NotImplementedError("sample_success_at/3's own situation argument must be goal_formula's own S.")
@@ -193,7 +203,17 @@ def _translate_sample_success_at(args, config, _factory, situation_var, bound):
         raise NotImplementedError('sample_success_at/3\'s own Tol argument must be a literal number, found: {}'.format(tol))
     x_m, y_m = _require_point(loc)
     cx, cy = config.to_cell(x_m), config.to_cell(y_m)
-    condition = '(and, sample_success, (and, (eq, x, {}), (eq, y, {})))'.format(cx, cy)
+    if not factory.sample_ids:
+        return '(False)'
+    per_id = []
+    for sample_id in sorted(factory.sample_ids):
+        success_var = factory.sample_success_var(sample_id)
+        pos_x_var = factory.sample_pos_x_var(sample_id)
+        pos_y_var = factory.sample_pos_y_var(sample_id)
+        per_id.append('(and, {}, (and, (eq, {}, {}), (eq, {}, {})))'.format(success_var, pos_x_var, cx, pos_y_var, cy))
+    condition = per_id[0]
+    for extra in per_id[1:]:
+        condition = '(or, {}, {})'.format(condition, extra)
     return _wrap_finally(condition, bound)
 
 
