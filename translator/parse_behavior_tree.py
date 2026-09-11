@@ -121,16 +121,26 @@ def _build_non_moveto_leaf(tag, attrib, factory):
     if tag == 'HaltedWith':
         return 'check', factory.make_halted_with()
     if tag == 'TakeSample':
-        return 'action', factory.make_take_sample()
-    if tag == 'InstallTool':
+        return 'action', factory.make_take_sample(attrib['id'])
+    if tag == 'SampleValueBelow':
+        return 'check', factory.make_sample_value_below(attrib['id'], float(attrib['threshold']))
+    if tag == 'SampleValueEqual':
+        return 'check', factory.make_sample_value_equal(attrib['id'], float(attrib['threshold']))
+    if tag == 'SampleValueOver':
+        return 'check', factory.make_sample_value_over(attrib['id'], float(attrib['threshold']))
+    if tag in ('InstallTool', 'UninstallTool', 'DeployTool', 'RetractTool'):
         # `triggers=` (EXTRA battery-only halting conditions, beyond the
         # always-on battery=0% one) is deliberately ignored here, same
         # established precedent as MoveTo's own `triggers=` attribute --
         # a reactive Condition sibling in a ReactiveSequence/Fallback
         # achieves the same effect natively (see this module's own header).
-        return 'action', factory.make_install_tool(attrib['tool'])
-    if tag == 'UninstallTool':
-        return 'action', factory.make_uninstall_tool(attrib['tool'])
+        make_fn = {
+            'InstallTool': factory.make_install_tool,
+            'UninstallTool': factory.make_uninstall_tool,
+            'DeployTool': factory.make_deploy_tool,
+            'RetractTool': factory.make_retract_tool,
+        }[tag]
+        return 'action', make_fn(attrib['tool'])
     raise NotImplementedError('Unrecognized behavior_tree.xml tag: <{}> -- not in schema.yaml\'s vocabulary.'.format(tag))
 
 
@@ -160,7 +170,15 @@ def _unroll(element, factory, path):
     if len(children_elements) != 1:
         raise ValueError('<{}> must have exactly one child (found {}).'.format(tag, len(children_elements)))
     (child,) = children_elements
-    name = element.attrib.get('name', tag)
+    # Path-qualified default name (not just the bare tag) -- BehaVerify's
+    # own composite names must be globally unique (check_grammar.py's
+    # walk_tree: "Node name ... already exists"), and RetryUntilSuccessful/
+    # Repeat, unlike Sequence/Fallback, are exactly the kind of node a
+    # real tree is likely to use MULTIPLE unnamed times (wrapping
+    # different actions) -- so defaulting to the bare tag name would
+    # collide the moment a tree has two of them without an explicit
+    # `name=`.
+    name = element.attrib.get('name', '_'.join(path + [tag]))
     if count == 1:
         # BehaVerify's own composite_node grammar rejects a sequence/
         # selector with fewer than 2 children (check_grammar.py's
@@ -180,15 +198,32 @@ def _walk(element, factory, path):
         name = element.attrib.get('name', tag)
         children = []
         pending_moveto = None  # set by the most recent PlanWith sibling, consumed by the next MoveTo
+        # child_tag_occurrence: disambiguates multiple UNNAMED siblings of
+        # the SAME tag under this one composite -- needed now that
+        # RetryUntilSuccessful/Repeat make "two siblings sharing a tag,
+        # each defaulting to the same name" a realistic pattern (unlike
+        # Sequence/Fallback, which rarely repeat as unnamed siblings).
+        # The FIRST occurrence of any tag keeps the exact pre-existing
+        # naming (no suffix), so this changes nothing for any tree that
+        # never actually repeats a tag -- only the SECOND+ occurrence
+        # gets a distinguishing suffix, which BehaVerify's own composite/
+        # leaf name uniqueness requires (check_grammar.py's walk_tree:
+        # "Node name ... already exists").
+        child_tag_occurrence = {}
         for child in element:
             if child.tag == 'MoveTo':
                 moveto_name = pending_moveto if pending_moveto is not None else factory.make_move_to()
                 pending_moveto = None
-                alias = '_'.join(path + [name, 'MoveTo'])
+                occurrence = child_tag_occurrence.get('MoveTo', 0)
+                child_tag_occurrence['MoveTo'] = occurrence + 1
+                alias = '_'.join(path + [name, 'MoveTo'] + ([] if occurrence == 0 else [str(occurrence)]))
                 children.append(ir.TreeNode(kind='leaf', leaf_kind='action', leaf_ref=moveto_name, name=alias))
                 continue
             if child.tag in _COMPOSITE_TAGS or child.tag == 'Inverter' or child.tag in _UNROLL_TAGS:
-                children.append(_walk(child, factory, path + [name]))
+                occurrence = child_tag_occurrence.get(child.tag, 0)
+                child_tag_occurrence[child.tag] = occurrence + 1
+                child_path = path + [name] if occurrence == 0 else path + [name, '{}{}'.format(child.tag, occurrence)]
+                children.append(_walk(child, factory, child_path))
                 continue
             result = _build_non_moveto_leaf(child.tag, child.attrib, factory)
             if len(result) == 3:
@@ -196,7 +231,9 @@ def _walk(element, factory, path):
                 pending_moveto = next_moveto
             else:
                 leaf_kind, leaf_ref = result
-            alias = '_'.join(path + [name, child.tag])
+            occurrence = child_tag_occurrence.get(child.tag, 0)
+            child_tag_occurrence[child.tag] = occurrence + 1
+            alias = '_'.join(path + [name, child.tag] if occurrence == 0 else path + [name, child.tag, str(occurrence)])
             children.append(ir.TreeNode(kind='leaf', leaf_kind=leaf_kind, leaf_ref=leaf_ref, name=alias))
         return ir.TreeNode(kind='composite', node_type=node_type, memory=memory, name=name, children=children)
     if tag in _UNROLL_TAGS:
@@ -226,32 +263,35 @@ def collect_goal_points_m(xml_path):
     return points
 
 
+_TOOL_ACTION_TAGS = ('InstallTool', 'UninstallTool', 'DeployTool', 'RetractTool')
+
+
 def uses_tool_actions(xml_path):
     """
-    True iff behavior_tree.xml contains an InstallTool/UninstallTool node
-    anywhere -- checked BEFORE parse_tree() so LeafFactory.shared_variables
-    can decide, upfront, whether MoveTo needs to be hitch-aware (see
-    leaf_library.py's _moving_drain_for_hitch) without retroactively
-    rewriting an already-built MoveTo action once one of these tags is
-    found deeper in the tree walk (build order depends on XML structure,
-    not a fixed pass).
+    True iff behavior_tree.xml contains an InstallTool/UninstallTool/
+    DeployTool/RetractTool node anywhere -- checked BEFORE parse_tree()
+    so LeafFactory.shared_variables can decide, upfront, whether MoveTo
+    needs to be hitch-aware (see leaf_library.py's _moving_drain_for_
+    hitch) without retroactively rewriting an already-built MoveTo
+    action once one of these tags is found deeper in the tree walk
+    (build order depends on XML structure, not a fixed pass).
     """
     tree = ET.parse(xml_path)
-    return any(el.tag in ('InstallTool', 'UninstallTool') for el in tree.getroot().iter())
+    return any(el.tag in _TOOL_ACTION_TAGS for el in tree.getroot().iter())
 
 
 def collect_tool_instance_ids(xml_path):
     """
     Every distinct `tool="..."` INSTANCE id (not kind -- see
     leaf_library.py's module docstring on the multi-instance tool
-    feature) referenced by an InstallTool/UninstallTool tag anywhere in
-    the tree. Checked BEFORE shared_variables(), same reason as
-    uses_tool_actions above: the shared `hitch_id` fluent's own domain
-    must enumerate every instance id up front, and shared_variables()
-    only runs once.
+    feature) referenced by an InstallTool/UninstallTool/DeployTool/
+    RetractTool tag anywhere in the tree. Checked BEFORE
+    shared_variables(), same reason as uses_tool_actions above: the
+    shared `hitch_id` fluent's own domain must enumerate every instance
+    id up front, and shared_variables() only runs once.
     """
     tree = ET.parse(xml_path)
-    return {el.attrib['tool'] for el in tree.getroot().iter() if el.tag in ('InstallTool', 'UninstallTool')}
+    return {el.attrib['tool'] for el in tree.getroot().iter() if el.tag in _TOOL_ACTION_TAGS}
 
 
 def collect_move_to_aliases(tree_node):

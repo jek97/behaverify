@@ -235,6 +235,47 @@ def _translate_ploughed(args, _config, factory, situation_var, bound):
     return _wrap_finally('(eq, {}, True)'.format(var_name), bound)
 
 
+def _translate_sample_value(args, factory, situation_var, bound, op):
+    # sample_value_below/equal/over/3: sample_value_<cmp>(SampleId,
+    # Threshold, S) -- see basic_action_theory.pl's own note: TRUE iff
+    # SampleId's own take_sample SUCCEEDED somewhere in S's history and
+    # its own drawn value (0..10) compares `op` against Threshold. Same
+    # "current-state check already IS the whole-history search" shape
+    # sample_value_.../SampleValueBelow's own BT-condition twin uses
+    # (leaf_library._sample_value_check) -- sample_success_<id> persists
+    # once True, so checking it now covers "ever succeeded", gated so a
+    # never-sampled id reads as false rather than a stale/default value.
+    sample_id_term, threshold_term, s = args
+    if s != ('var', situation_var):
+        raise NotImplementedError("sample_value_below/equal/over/3's own situation argument must be goal_formula's own S.")
+    if sample_id_term[0] != 'atom':
+        raise NotImplementedError(
+            "sample_value_below/equal/over/3's own SampleId must be a literal atom, found: {}".format(sample_id_term)
+        )
+    if threshold_term[0] != 'num':
+        raise NotImplementedError(
+            "sample_value_below/equal/over/3's own Threshold must be a literal number, found: {}".format(threshold_term)
+        )
+    sample_id = sample_id_term[1]
+    threshold_int = int(round(threshold_term[1]))
+    success_var = factory.sample_success_var(sample_id)
+    value_var = factory.sample_value_var(sample_id)
+    condition = '(and, {}, ({}, {}, {}))'.format(success_var, op, value_var, threshold_int)
+    return _wrap_finally(condition, bound)
+
+
+def _translate_sample_value_below(args, _config, factory, situation_var, bound):
+    return _translate_sample_value(args, factory, situation_var, bound, 'lt')
+
+
+def _translate_sample_value_equal(args, _config, factory, situation_var, bound):
+    return _translate_sample_value(args, factory, situation_var, bound, 'eq')
+
+
+def _translate_sample_value_over(args, _config, factory, situation_var, bound):
+    return _translate_sample_value(args, factory, situation_var, bound, 'gt')
+
+
 def _translate_battery_depleted_in(args, _config, factory, situation_var, bound):
     (s,) = args
     if s != ('var', situation_var):
@@ -253,6 +294,9 @@ _DISPATCH = {
     ('visited', 3): _translate_visited,
     ('battery_depleted_in', 1): _translate_battery_depleted_in,
     ('sample_success_at', 3): _translate_sample_success_at,
+    ('sample_value_below', 3): _translate_sample_value_below,
+    ('sample_value_equal', 3): _translate_sample_value_equal,
+    ('sample_value_over', 3): _translate_sample_value_over,
     ('ploughed', 3): _translate_ploughed,
 }
 

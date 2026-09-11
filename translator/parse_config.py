@@ -83,30 +83,46 @@ class ProblemConfig:
         self.disc_step_time = raw['grounding']['disc_step_time']
 
         # ------------------------------------------------------------
-        # TakeSample / InstallTool / UninstallTool (new actions in the
-        # source theory -- see basic_action_theory.pl's own
-        # do_node(take_sample(...))/install_tool_leg/uninstall_tool_leg).
-        # Same key shape and defaults as config_to_prolog.py's own
-        # _binary_result_block/_tool_duration_facts/_tool_moveto_param_facts,
-        # so a config.yaml with none of these sections behaves exactly
-        # like the source system's own defaults.
+        # TakeSample / InstallTool / UninstallTool / DeployTool /
+        # RetractTool (new actions in the source theory -- see
+        # basic_action_theory.pl's own do_node(take_sample(...))/
+        # install_tool_leg/uninstall_tool_leg/deploy_tool_leg/
+        # retract_tool_leg). Same key shape and defaults as
+        # config_to_prolog.py's own _binary_result_block/
+        # _tool_duration_facts/_tool_moveto_param_facts/
+        # _tool_deployed_param_facts, so a config.yaml with none of
+        # these sections behaves exactly like the source system's own
+        # defaults.
+        #
+        # NOTE: there is deliberately no *_success_probability field
+        # here (sample.success_probability, tool.install/uninstall/
+        # deploy/retract.success_probability all exist in config.yaml,
+        # but this translator never reads any of them) -- every coin
+        # flip in this model is translated as a FULL nondeterministic
+        # choice regardless of the actual probability value (LTL/CTL
+        # model checking asks "can this happen", not "how likely",
+        # same treatment noise_x/noise_y/battery_noise already get), so
+        # the number itself plays no role in generation.
         # ------------------------------------------------------------
-        self.sample_success_probability = float(raw.get('sample', {}).get('success_probability', 0.5))
-
         tool_cfg = raw.get('tool', {})
         install_cfg = tool_cfg.get('install', {})
         uninstall_cfg = tool_cfg.get('uninstall', {})
+        deploy_cfg = tool_cfg.get('deploy', {})
+        retract_cfg = tool_cfg.get('retract', {})
         equipped_cfg = tool_cfg.get('equipped', {})
 
-        self.install_success_probability = float(install_cfg.get('success_probability', 0.9))
-        self.uninstall_success_probability = float(uninstall_cfg.get('success_probability', 0.9))
         # ONE drain rate per action TYPE (not per tool) -- matches
         # config_to_prolog.py's own install_tool_drain_rate/1/
-        # uninstall_tool_drain_rate/1 shape.
+        # uninstall_tool_drain_rate/1/deploy_tool_drain_rate/1/
+        # retract_tool_drain_rate/1 shape.
         self.install_drain_rate = float(install_cfg.get('drain_rate', self.idle_drain_rate))
         self.uninstall_drain_rate = float(uninstall_cfg.get('drain_rate', self.idle_drain_rate))
+        self.deploy_drain_rate = float(deploy_cfg.get('drain_rate', self.idle_drain_rate))
+        self.retract_drain_rate = float(retract_cfg.get('drain_rate', self.idle_drain_rate))
         self._install_duration_s = install_cfg.get('duration_seconds', {})
         self._uninstall_duration_s = uninstall_cfg.get('duration_seconds', {})
+        self._deploy_duration_s = deploy_cfg.get('duration_seconds', {})
+        self._retract_duration_s = retract_cfg.get('duration_seconds', {})
 
         # tool.equipped.<cart|plow>.moving_drain_rate: the MoveTo drain
         # rate used WHILE that tool is equipped (hitch(Tool,S) --
@@ -121,6 +137,29 @@ class ProblemConfig:
             tool: float(equipped_cfg.get(tool, {}).get('moving_drain_rate', self.moving_drain_rate))
             for tool in ('cart', 'plow')
         }
+        # tool.equipped.<cart|plow>.deployed_moving_drain_rate: the
+        # MoveTo drain rate used while deployed(S) additionally holds
+        # (basic_action_theory.pl's own effective_tool_moving_drain_
+        # rate/3, currently reachable for plow only -- see leaf_
+        # library.py's make_deploy_tool). Defaults to that SAME kind's
+        # own regular (hitched-but-not-deployed) rate, matching
+        # config_to_prolog.py's own "deploying changes nothing unless
+        # config.yaml says otherwise" default. deployed_speed is
+        # intentionally NOT read here, same reasoning as tool.equipped.
+        # <tool>.speed above.
+        self.tool_moving_drain_rate_deployed = {
+            tool: float(equipped_cfg.get(tool, {}).get('deployed_moving_drain_rate', self.tool_moving_drain_rate[tool]))
+            for tool in ('cart', 'plow')
+        }
+
+        # sample.value.mean/sigma -- the READING a SUCCESSFUL TakeSample
+        # draws (basic_action_theory.pl's own sample_value/3, a
+        # discretized Normal over 0..10). Like the probabilities noted
+        # above, this translator does not weight outcomes by the actual
+        # bell-curve shape -- see leaf_library.py's make_take_sample --
+        # so mean/sigma themselves are never read here; every value
+        # 0..10 is treated as equally POSSIBLE (nondeterministic choice)
+        # regardless of how likely config.yaml's own curve makes it.
 
         # ------------------------------------------------------------
         # Multi-instance tools -- a BT's own <InstallTool tool="..."> /
@@ -179,6 +218,14 @@ class ProblemConfig:
     def uninstall_duration_ticks(self, kind):
         """See install_duration_ticks's own note -- same shape, uninstall's own config key."""
         return max(1, round(float(self._uninstall_duration_s.get(kind, 10.0))))
+
+    def deploy_duration_ticks(self, kind):
+        """See install_duration_ticks's own note -- same shape, deploy's own config key."""
+        return max(1, round(float(self._deploy_duration_s.get(kind, 10.0))))
+
+    def retract_duration_ticks(self, kind):
+        """See install_duration_ticks's own note -- same shape, retract's own config key."""
+        return max(1, round(float(self._retract_duration_s.get(kind, 10.0))))
 
     def to_cell(self, value_metres):
         return round_position_to_cell(value_metres, self.disc_step_position)

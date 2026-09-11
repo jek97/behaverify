@@ -38,9 +38,20 @@ with no derived-trigger bookkeeping needed. Battery reaching 0 mid-move is
 still handled inside MoveTo itself, since running out of energy is a
 physical property of the action, not a configurable trigger.
 
-TakeSample/InstallTool/UninstallTool ARE implemented (see make_take_sample/
-make_install_tool/make_uninstall_tool below) -- InstallTool/UninstallTool's
-own `triggers=` port is ignored, same established precedent as MoveTo's.
+TakeSample/InstallTool/UninstallTool/DeployTool/RetractTool ARE implemented
+(see make_take_sample/make_install_tool/make_uninstall_tool/
+make_deploy_tool/make_retract_tool below) -- InstallTool/UninstallTool/
+DeployTool/RetractTool's own `triggers=` port is ignored, same established
+precedent as MoveTo's. TakeSample now requires an `id=` port (e.g.
+"soil1"); on success it also draws a value 0..10 (config.yaml's sample.
+value.mean/sigma, a discretized Normal -- see make_take_sample), readable
+back via SampleValueBelow/Equal/Over(id,threshold) (make_sample_value_
+below/equal/over) or goal_formula.py's sample_value_below/equal/over/3.
+DeployTool/RetractTool (make_deploy_tool/make_retract_tool) are currently
+restricted to tool kind=plow, mirroring basic_action_theory.pl's own
+poss(start_deploy_tool(...)) kind check -- but caught at TRANSLATION time
+here (this translator parses config.yaml, unlike bt_to_prolog.py, so it
+doesn't need to defer the check to a runtime Prolog failure).
 The one thing NOT modeled is robot VELOCITY changing while a tool is
 equipped (tool.equipped.<tool>.speed in config.yaml) -- MoveTo already
 ignores config.yaml's own BASE motion.speed entirely (ticks are cells, not
@@ -198,10 +209,25 @@ class LeafFactory:
             self.enum_atoms.update(id_atoms)
             self.enum_atoms.add("'free'")
             variables.append(ir.Variable('hitch_id', 'bl', 'VAR', '{' + ', '.join(["'free'"] + id_atoms) + '}', initial="'free'"))
+            # deployed: a boolean fluent mirroring hitch's own "only a
+            # SUCCESSFUL halt flips it" discipline -- basic_action_
+            # theory.pl's own deployed/1. Currently reachable for plow
+            # only (make_deploy_tool/make_retract_tool reject any other
+            # kind), but kept as a single GLOBAL boolean, not per-
+            # instance -- only one tool can ever be hitched at a time, so
+            # only one could ever be deployed at a time either. Always
+            # declared whenever tool_aware (not gated on the tree
+            # actually using DeployTool/RetractTool): UninstallTool's own
+            # precondition now unconditionally reads it too (see
+            # _make_tool_action).
+            variables.append(ir.Variable('deployed', 'bl', 'VAR', 'BOOLEAN', initial='False'))
             # MoveTo's drain rate WHILE a tool is equipped (tool.equipped.
-            # <tool>.moving_drain_rate) -- see _moving_drain_for_hitch.
+            # <tool>.moving_drain_rate), and its OWN further switch while
+            # deployed(S) also holds (tool.equipped.<tool>.deployed_
+            # moving_drain_rate) -- see _moving_drain_for_hitch.
             self.constants['MOVING_DRAIN_CART'] = int(round(self.config.tool_moving_drain_rate['cart']))
             self.constants['MOVING_DRAIN_PLOW'] = int(round(self.config.tool_moving_drain_rate['plow']))
+            self.constants['MOVING_DRAIN_PLOW_DEPLOYED'] = int(round(self.config.tool_moving_drain_rate_deployed['plow']))
             # install_tool_range(Range) -- see basic_action_theory.pl's
             # own poss(start_install_tool(...)); ceil to never let a
             # real in-range attempt round down and wrongly fail (same
@@ -242,7 +268,12 @@ class LeafFactory:
         updates = []
         for (cx, cy) in sorted(self.ploughed_cells):
             var_name = self.ploughed_var(cx, cy)
-            condition = "(and, (eq, hitch, 'plow'), (and, (eq, x, {}), (eq, y, {})))".format(cx, cy)
+            # ploughed now ALSO requires deployed(SPrev), not just
+            # hitch(plow,SPrev) -- basic_action_theory.pl's own
+            # "DeployTool/RetractTool: ploughing now requires deployed,
+            # not just hitched" note: merely having the plow installed
+            # and walking around should NOT mark any cells ploughed.
+            condition = "(and, (eq, hitch, 'plow'), (and, deployed, (and, (eq, x, {}), (eq, y, {}))))".format(cx, cy)
             updates.append(('case_var', var_name, [
                 (condition, ['True']),
                 (None, [var_name]),
@@ -261,8 +292,17 @@ class LeafFactory:
         read at all, so make_move_to/_make_policy_based_plan fall back to
         the plain MOVING_DRAIN constant in that case, unchanged from
         before this feature existed.
+
+        Plow additionally switches to a THIRD rate while deployed(S) also
+        holds (basic_action_theory.pl's own effective_tool_moving_drain_
+        rate/3) -- currently only plow can ever deploy, so cart's own
+        branch has no deployed-specific variant to check.
         """
-        return "(if, (eq, hitch, 'cart'), MOVING_DRAIN_CART, (if, (eq, hitch, 'plow'), MOVING_DRAIN_PLOW, MOVING_DRAIN))"
+        return (
+            "(if, (eq, hitch, 'cart'), MOVING_DRAIN_CART, "
+            "(if, (eq, hitch, 'plow'), (if, deployed, MOVING_DRAIN_PLOW_DEPLOYED, MOVING_DRAIN_PLOW), "
+            "MOVING_DRAIN))"
+        )
 
     def obstacle_variable(self):
         """Lazily builds the static obstacle-clearance lookup array (only if a
@@ -324,7 +364,7 @@ class LeafFactory:
         read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise']
         write_variables = ['x', 'y', 'prev_x', 'prev_y', 'battery']
         if self.tool_aware:
-            read_variables.append('hitch')
+            read_variables += ['hitch', 'deployed']
         ploughed_vars = [self.ploughed_var(cx, cy) for (cx, cy) in sorted(self.ploughed_cells)]
         read_variables += ploughed_vars
         write_variables += ploughed_vars
@@ -461,7 +501,7 @@ class LeafFactory:
         read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', dx_var, dy_var]
         write_variables = ['x', 'y', 'prev_x', 'prev_y', 'battery']
         if self.tool_aware:
-            read_variables.append('hitch')
+            read_variables += ['hitch', 'deployed']
         ploughed_vars = [self.ploughed_var(cx, cy) for (cx, cy) in sorted(self.ploughed_cells)]
         read_variables += ploughed_vars
         write_variables += ploughed_vars
@@ -487,48 +527,85 @@ class LeafFactory:
         self.actions[moveto_name] = moveto_action
         return plan_name, moveto_name
 
-    def make_take_sample(self):
+    @staticmethod
+    def sample_success_var(sample_id):
+        return 'sample_success_{}'.format(sample_id)
+
+    @staticmethod
+    def sample_value_var(sample_id):
+        return 'sample_value_{}'.format(sample_id)
+
+    def make_take_sample(self, sample_id):
         """
         take_sample(ActionCode) in basic_action_theory.pl: instantaneous,
         like PlanWith -- but UNLIKE every other action, its outcome is a
         genuine new probabilistic choice (config.yaml's own sample.
         success_probability), not a deterministic function of the current
-        state. Translated the same way every other probabilistic draw in
-        this model is (noise_x/noise_y/battery_noise) -- as a full
-        nondeterministic choice, not weighted by the actual probability
-        value, since nuXmv's LTL/CTL model checking asks "can this happen"
-        (possibility), not "how likely is this" -- so the exact
-        probability number in config.yaml plays no role here, only
-        WHETHER both outcomes are possible (they always are, barring a
-        literal 0.0 or 1.0 -- not specially handled, since exploring a
-        branch that happens to always come out the same way costs
-        nothing extra, it just never gets exercised).
+        state, and -- ONLY on success -- a SECOND independent draw, a
+        value 0..10 (config.yaml's sample.value.mean/sigma, a discretized
+        Normal). Both are translated the same way every other
+        probabilistic draw in this model is (noise_x/noise_y/
+        battery_noise) -- as a full nondeterministic choice, not weighted
+        by the actual probability/bell-curve shape, since nuXmv's LTL/CTL
+        model checking asks "can this happen" (possibility), not "how
+        likely is this" -- so neither config number plays any role here,
+        only WHETHER an outcome is possible at all (every one of the 11
+        values is, barring a literal 0.0-mass tail -- not specially
+        handled, since exploring a branch that never actually gets drawn
+        costs nothing extra).
+
+        `sample_id` (schema.yaml's own required `id` port, e.g. "soil1")
+        is the tree author's own name for this occurrence -- NOT the
+        auto-generated ActionCode BT.cpp's own translator uses -- and is
+        what a LATER SampleValueBelow/Equal/Over condition (or a goal
+        formula's own sample_value_below/equal/over/3) references to read
+        THIS specific sample's own value back out. Each distinct id gets
+        its own dedicated action + variables (unlike the old, portless
+        TakeSample, which was a single shared action) -- same "keyed by
+        the parameters that make different occurrences actually
+        different" idiom PlanStraight_<gx>_<gy> already uses.
 
         Position (x,y) is already global blackboard state and doesn't
         change during this instantaneous action, so "record the robot's
         position at the instant of sampling" (the reason port's own
-        sample_success(X,Y,ActionCode)) needs no bookkeeping of its own --
-        x,y already ARE that position for as long as sample_success stays
-        True (see goal_formula.py if a future goal formula needs
-        sample_success_at/3 -- not implemented, no example uses it yet).
+        sample_success(X,Y,V,SampleId,ActionCode)) needs no bookkeeping
+        of its own -- x,y already ARE that position for as long as
+        sample_success_<id> stays True (see goal_formula.py's
+        sample_success_at/3).
         """
-        name = 'TakeSample'
+        name = 'TakeSample_{}'.format(sample_id)
         if name in self.actions:
             return name
+        success_var = self.sample_success_var(sample_id)
+        value_var = self.sample_value_var(sample_id)
         action = ir.Action(
             name=name,
-            read_variables=['sample_success'],
-            write_variables=['sample_success'],
+            read_variables=[success_var, value_var],
+            write_variables=[success_var, value_var],
             updates=[
-                ('case_var', 'sample_success', [(None, ['True', 'False'])]),
+                ('case_var', success_var, [(None, ['True', 'False'])]),
+                # value is drawn ONLY on success (reads success_var's OWN
+                # just-staged new value, from the case_var immediately
+                # above, per this module's own staging convention) --
+                # held (not resampled) on a failed draw, matching the
+                # theory's own "value only exists conditional on
+                # success" shape; SampleValueBelow/Equal/Over below
+                # additionally gates on success_var, so a stale held
+                # value from an EARLIER success can never be misread
+                # after a later failure.
+                ('case_var', value_var, [
+                    (success_var, [str(v) for v in range(11)]),
+                    (None, [value_var]),
+                ]),
             ],
             return_cases=[
-                ('(eq, sample_success, True)', 'success'),
+                ('(eq, {}, True)'.format(success_var), 'success'),
                 (None, 'failure'),
             ],
         )
         self.actions[name] = action
-        self.extra_variables.append(ir.Variable('sample_success', 'bl', 'VAR', 'BOOLEAN', initial='False'))
+        self.extra_variables.append(ir.Variable(success_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
+        self.extra_variables.append(ir.Variable(value_var, 'bl', 'VAR', '[0, 10]', initial='0'))
         return name
 
     def make_install_tool(self, tool_id):
@@ -536,6 +613,12 @@ class LeafFactory:
 
     def make_uninstall_tool(self, tool_id):
         return self._make_tool_action('Uninstall', tool_id)
+
+    def make_deploy_tool(self, tool_id):
+        return self._make_tool_action('Deploy', tool_id)
+
+    def make_retract_tool(self, tool_id):
+        return self._make_tool_action('Retract', tool_id)
 
     def _ensure_tool_position_vars(self, tool_id):
         """
@@ -571,15 +654,19 @@ class LeafFactory:
     def _tool_pos_y_var(tool_id):
         return '{}_pos_y'.format(tool_id)
 
+    # config lookup + precondition shape per action kind -- see
+    # _make_tool_action's own docstring for what each precondition means.
+    _TOOL_ACTION_KINDS = ('Install', 'Uninstall', 'Deploy', 'Retract')
+
     def _make_tool_action(self, action_kind, tool_id):
         """
-        Shared InstallTool/UninstallTool builder -- durative, FIXED-Duration
-        actions (config.yaml's tool.install/uninstall.duration_seconds.
-        <kind>, ROUNDED DIRECTLY to ticks -- see ProblemConfig.
-        install_duration_ticks's own note on why: this translator has no
-        other seconds<->tick conversion anywhere, MoveTo's own "one grid
-        cell per tick" being an equally arbitrary, explicitly-approved
-        choice rather than a physically-derived one).
+        Shared InstallTool/UninstallTool/DeployTool/RetractTool builder --
+        durative, FIXED-Duration actions (config.yaml's tool.<kind_lower>.
+        duration_seconds.<tool_kind>, ROUNDED DIRECTLY to ticks -- see
+        ProblemConfig.install_duration_ticks's own note on why: this
+        translator has no other seconds<->tick conversion anywhere,
+        MoveTo's own "one grid cell per tick" being an equally arbitrary,
+        explicitly-approved choice rather than a physically-derived one).
 
         `tool_id` names a specific tool INSTANCE (e.g. "cart1"), not a
         kind -- config.yaml's tool.instances maps each id to a kind and a
@@ -589,78 +676,103 @@ class LeafFactory:
         config_to_prolog.py's own validation, just done earlier -- this
         translator DOES parse config.yaml, unlike bt_to_prolog.py, so
         there's no reason to defer the check to a runtime Prolog failure
-        the way that file has to).
+        the way that file has to). DeployTool/RetractTool are additionally
+        restricted to kind=plow (basic_action_theory.pl's own poss(
+        start_deploy_tool(...)) enforces this at the Prolog level, since
+        THAT translator can't see config.yaml at all; this one can, so it
+        catches the same mistake at translation time instead).
 
         Mechanism, mirroring basic_action_theory.pl's own install_tool_leg/
-        uninstall_tool_leg:
+        uninstall_tool_leg/deploy_tool_leg/retract_tool_leg:
           - precondition not holding -> immediate failure, state
             untouched -- this action is structurally IMPOSSIBLE from a
             poss/2 point of view (not a probabilistic failure), and an
             immediate failure is the closest this return-status-only leaf
             shape can capture that (can only actually arise from
             re-entering an already-resolved node, e.g. inside
-            RetryUntilSuccessful/Repeat). Install's own precondition is
-            hitch(free) AND proximity to THIS instance's own CURRENT
-            tool_position (within INSTALL_RANGE, config.yaml's tool.
-            install.range) -- reusing the same Chebyshev-distance
-            primitive DistanceBelow's own check uses, just between two
-            VARIABLE pairs (x,y vs this id's own pos_x/pos_y) instead of
-            a compile-time-constant goal; still only sub/abs/max, no
-            `mult` of two variable-derived expressions, so this doesn't
-            reintroduce the confirmed nuXmv blowup pattern (see
-            squared_distance_condition's own note). Uninstall's own
-            precondition is hitch_id(THIS id) -- not just hitch(kind) --
-            since only hitch_id can tell "cart1 attached" from "cart2
-            attached" apart.
+            RetryUntilSuccessful/Repeat). Preconditions:
+              Install:    hitch(free) AND proximity to THIS instance's
+                          own CURRENT tool_position (within INSTALL_
+                          RANGE) -- reusing the same Chebyshev-distance
+                          primitive DistanceBelow's own check uses, just
+                          between two VARIABLE pairs (x,y vs this id's
+                          own pos_x/pos_y) instead of a compile-time-
+                          constant goal; still only sub/abs/max, no
+                          `mult` of two variable-derived expressions, so
+                          this doesn't reintroduce the confirmed nuXmv
+                          blowup pattern (see squared_distance_
+                          condition's own note).
+              Uninstall:  hitch_id(THIS id) AND NOT deployed -- a
+                          deployed tool must be retracted first.
+              Deploy:     hitch_id(THIS id) AND NOT deployed.
+              Retract:    hitch_id(THIS id) AND deployed.
+            hitch_id (not hitch) is what tells "cart1 attached" from
+            "cart2 attached" apart.
           - battery already at 0 -> failure (the one ALWAYS-on trigger;
             the `triggers=` port's own EXTRA battery-only halts are out of
             scope, same precedent as MoveTo's own `triggers=`).
           - Duration elapses with nothing halting early -> a genuine coin
             flip (config.yaml's own success_probability, default 0.9),
             translated to nondeterministic choice exactly like
-            make_take_sample above -- on success, hitch (KIND) and
-            hitch_id (INSTANCE) both flip (Install: this id/its kind;
-            Uninstall: free/free), and -- uninstall only -- this id's own
-            tool_position updates to wherever the robot currently is
-            (dropped there); on failure, all three are unchanged, per the
-            theory's own hitch/2/hitch_id/2/tool_position/4 clauses.
+            make_take_sample above -- on success:
+              Install:    hitch (KIND) := this id's kind, hitch_id := this id.
+              Uninstall:  hitch := free, hitch_id := free, tool_position
+                          (this id's own pos_x/pos_y) updates to wherever
+                          the robot currently is (dropped there).
+              Deploy:     deployed := True.
+              Retract:    deployed := False.
+            on failure, none of these change, per the theory's own
+            hitch/2/hitch_id/2/tool_position/4/deployed/1 clauses.
           - otherwise -> drain battery at THIS action's own rate
-            (tool.install/uninstall.drain_rate, default idle_drain_rate),
+            (tool.<kind_lower>.drain_rate, default idle_drain_rate),
             increment the elapsed-ticks counter (self-resetting once
             resolved, same shape as the drift mechanism's own
             ticks_since_resample), return running.
         """
-        is_install = action_kind == 'Install'
+        if action_kind not in self._TOOL_ACTION_KINDS:
+            raise ValueError('Unknown tool action kind: {!r}'.format(action_kind))
         name = '{}Tool_{}'.format(action_kind, tool_id)
         if name in self.actions:
             return name
         if tool_id not in self.config.tool_instance_kind:
             raise NotImplementedError(
                 '{}Tool tool={!r}: no tool.instances entry in config.yaml for this '
-                "id -- every instance id a tree's InstallTool/UninstallTool nodes "
-                'reference needs its own {{id,kind,x,y}} entry under '
-                'tool.instances.'.format(action_kind, tool_id)
+                "id -- every instance id a tree's InstallTool/UninstallTool/"
+                'DeployTool/RetractTool nodes reference needs its own '
+                '{{id,kind,x,y}} entry under tool.instances.'.format(action_kind, tool_id)
             )
         tool_kind = self.config.tool_instance_kind[tool_id]  # 'cart'/'plow', resolved at translation time
-        self._ensure_tool_position_vars(tool_id)
-        pos_x_var = self._tool_pos_x_var(tool_id)
-        pos_y_var = self._tool_pos_y_var(tool_id)
+        if action_kind in ('Deploy', 'Retract') and tool_kind != 'plow':
+            raise NotImplementedError(
+                '{}Tool tool={!r}: kind={!r} -- deploy/retract is currently only '
+                "modeled for plow (matching basic_action_theory.pl's own "
+                'poss(start_deploy_tool(...)) kind restriction).'.format(action_kind, tool_id, tool_kind)
+            )
 
-        duration_ticks = (
-            self.config.install_duration_ticks(tool_kind) if is_install
-            else self.config.uninstall_duration_ticks(tool_kind)
-        )
-        drain_rate = int(round(self.config.install_drain_rate if is_install else self.config.uninstall_drain_rate))
+        duration_ticks_fn = {
+            'Install': self.config.install_duration_ticks,
+            'Uninstall': self.config.uninstall_duration_ticks,
+            'Deploy': self.config.deploy_duration_ticks,
+            'Retract': self.config.retract_duration_ticks,
+        }[action_kind]
+        drain_rate = int(round({
+            'Install': self.config.install_drain_rate,
+            'Uninstall': self.config.uninstall_drain_rate,
+            'Deploy': self.config.deploy_drain_rate,
+            'Retract': self.config.retract_drain_rate,
+        }[action_kind]))
+        duration_ticks = duration_ticks_fn(tool_kind)
+
         elapsed_var = '{}_elapsed'.format(name.lower())
         outcome_var = '{}_outcome'.format(name.lower())
         # precondition_held/resolved: SNAPSHOTS of the precondition/
-        # duration-elapsed check, captured from hitch/hitch_id/elapsed_var's
-        # PRE-tick values as the FIRST two update statements, then reused
-        # everywhere else in this SAME tick (including return_cases,
-        # which only ever sees POST-update/staged values -- see ir.py's
-        # own note on staging). Without this, return_cases re-deriving
-        # "is the precondition satisfied"/"has duration elapsed" from
-        # hitch/hitch_id/elapsed_var directly would read the NEWLY updated
+        # duration-elapsed check, captured from hitch/hitch_id/deployed/
+        # elapsed_var's PRE-tick values as the FIRST two update
+        # statements, then reused everywhere else in this SAME tick
+        # (including return_cases, which only ever sees POST-update/
+        # staged values -- see ir.py's own note on staging). Without
+        # this, return_cases re-deriving "is the precondition satisfied"/
+        # "has duration elapsed" directly would read the NEWLY updated
         # values instead of the ones this tick's decision was actually
         # based on -- e.g. a successful install flips hitch/hitch_id away
         # from free in THIS SAME tick, which would make a freshly-
@@ -673,14 +785,38 @@ class LeafFactory:
         self.extra_variables.append(ir.Variable(precondition_held_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
         self.extra_variables.append(ir.Variable(resolved_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
 
-        if is_install:
+        read_variables = ['hitch', 'hitch_id', 'deployed', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var]
+        write_variables = ['battery', elapsed_var, outcome_var, precondition_held_var, resolved_var]
+        # success_updates: (var_name, new_value_code_on_success) pairs --
+        # turned into uniform case_var entries below. Only the variable(s)
+        # THIS action kind can actually change need to appear here (a
+        # write_variables entry not listed here would never change, so
+        # there's no point declaring it writable).
+        if action_kind == 'Install':
+            self._ensure_tool_position_vars(tool_id)
+            pos_x_var, pos_y_var = self._tool_pos_x_var(tool_id), self._tool_pos_y_var(tool_id)
             proximity_ok = squared_distance_condition('x', 'y', pos_x_var, pos_y_var, 'INSTALL_RANGE', 'lt')
             precondition_ok = "(and, (eq, hitch, 'free'), {})".format(proximity_ok)
-        else:
-            precondition_ok = "(eq, hitch_id, '{}')".format(tool_id)
+            success_updates = [('hitch', "'{}'".format(tool_kind)), ('hitch_id', "'{}'".format(tool_id))]
+            read_variables += ['x', 'y', pos_x_var, pos_y_var]
+            write_variables += ['hitch', 'hitch_id']
+        elif action_kind == 'Uninstall':
+            self._ensure_tool_position_vars(tool_id)
+            pos_x_var, pos_y_var = self._tool_pos_x_var(tool_id), self._tool_pos_y_var(tool_id)
+            precondition_ok = "(and, (eq, hitch_id, '{}'), (not, deployed))".format(tool_id)
+            success_updates = [('hitch', "'free'"), ('hitch_id', "'free'"), (pos_x_var, 'x'), (pos_y_var, 'y')]
+            read_variables += ['x', 'y', pos_x_var, pos_y_var]
+            write_variables += ['hitch', 'hitch_id', pos_x_var, pos_y_var]
+        elif action_kind == 'Deploy':
+            precondition_ok = "(and, (eq, hitch_id, '{}'), (not, deployed))".format(tool_id)
+            success_updates = [('deployed', 'True')]
+            write_variables += ['deployed']
+        else:  # Retract
+            precondition_ok = "(and, (eq, hitch_id, '{}'), deployed)".format(tool_id)
+            success_updates = [('deployed', 'False')]
+            write_variables += ['deployed']
+
         duration_reached = '(gte, {}, {})'.format(elapsed_var, duration_ticks)
-        new_hitch_on_success = "'{}'".format(tool_kind) if is_install else "'free'"
-        new_hitch_id_on_success = "'{}'".format(tool_id) if is_install else "'free'"
         resolved_and_succeeded = '(and, {}, {})'.format(resolved_var, outcome_var)
 
         updates = [
@@ -696,27 +832,16 @@ class LeafFactory:
                 (None, ['0']),
             ]),
             ('var', 'battery', '(if, {ok}, (max, 0, (sub, battery, {rate})), battery)'.format(ok=precondition_held_var, rate=drain_rate)),
-            ('case_var', 'hitch', [
-                (resolved_and_succeeded, [new_hitch_on_success]),
-                (None, ['hitch']),
-            ]),
-            ('case_var', 'hitch_id', [
-                (resolved_and_succeeded, [new_hitch_id_on_success]),
-                (None, ['hitch_id']),
-            ]),
         ]
-        write_variables = ['hitch', 'hitch_id', 'battery', elapsed_var, outcome_var, precondition_held_var, resolved_var]
-        if not is_install:
-            # a successful uninstall drops the tool wherever the robot
-            # currently is -- tool_position(Id,GX,GY,do(halt_uninstall_
-            # tool(...,uninstall_tool_success(Id,_),true),S)) :- at(GX,GY,T,S).
-            updates.append(('case_var', pos_x_var, [(resolved_and_succeeded, ['x']), (None, [pos_x_var])]))
-            updates.append(('case_var', pos_y_var, [(resolved_and_succeeded, ['y']), (None, [pos_y_var])]))
-            write_variables += [pos_x_var, pos_y_var]
+        for var_name, new_value_on_success in success_updates:
+            updates.append(('case_var', var_name, [
+                (resolved_and_succeeded, [new_value_on_success]),
+                (None, [var_name]),
+            ]))
 
         action = ir.Action(
             name=name,
-            read_variables=['hitch', 'hitch_id', 'battery', 'x', 'y', pos_x_var, pos_y_var, elapsed_var, outcome_var, precondition_held_var, resolved_var],
+            read_variables=read_variables,
             write_variables=write_variables,
             updates=updates,
             return_cases=[
@@ -770,6 +895,40 @@ class LeafFactory:
         if name in self.checks:
             return name
         self.checks[name] = ir.Check(name, ['x', 'y'], squared_distance_condition('x', 'y', gx, gy, tol, op))
+        return name
+
+    def make_sample_value_below(self, sample_id, threshold):
+        return self._sample_value_check('SampleValueBelow', 'lt', sample_id, threshold)
+
+    def make_sample_value_equal(self, sample_id, threshold):
+        return self._sample_value_check('SampleValueEqual', 'eq', sample_id, threshold)
+
+    def make_sample_value_over(self, sample_id, threshold):
+        return self._sample_value_check('SampleValueOver', 'gt', sample_id, threshold)
+
+    def _sample_value_check(self, prefix, op, sample_id, threshold):
+        """
+        holds(sample_value_below/equal/over(SampleId,Threshold), S) --
+        checks the VALUE a SUCCESSFUL <TakeSample id="..."/> came back
+        with. A HISTORY lookup, same shape as HaltedWith (the value is
+        fixed the instant it's drawn) -- but since this translator's own
+        sample_success_<id>/sample_value_<id> already PERSIST as plain
+        bl fluents (see make_take_sample), a plain current-state check
+        already IS the history lookup: sample_success_<id> stays True
+        from the moment of a real success onward (until the SAME id's
+        TakeSample runs again), so checking it now is equivalent to
+        "did id ever succeed, and is its value still the one from that
+        success" -- gated on sample_success_<id> so a never-sampled (or
+        since-resampled-to-failure) id reads as false, not a stale value.
+        """
+        threshold_int = int(round(threshold))
+        name = '{}_{}_{}'.format(prefix, sample_id, threshold_int).replace('-', 'm')
+        if name in self.checks:
+            return name
+        success_var = self.sample_success_var(sample_id)
+        value_var = self.sample_value_var(sample_id)
+        condition = '(and, {}, ({}, {}, {}))'.format(success_var, op, value_var, threshold_int)
+        self.checks[name] = ir.Check(name, [success_var, value_var], condition)
         return name
 
     def make_obstacle_in_bound(self, threshold_m):
