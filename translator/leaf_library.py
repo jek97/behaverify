@@ -568,6 +568,127 @@ class LeafFactory:
         self.actions[moveto_name] = moveto_action
         return plan_name, moveto_name
 
+    def make_plan_with_waypoints(self, waypoints_m):
+        """
+        PlanWithWaypoints(algorithm, waypoints="X1;Y1|X2;Y2|...") -- Tier
+        4 (per the approved simplification): schema.yaml's own dastar-
+        style "resample by arc length, chain straight-line legs" is
+        already exactly what THIS translator's grid needs no resampling
+        step to reach -- every waypoint IS already a grid cell, so the
+        whole node collapses to "visit these cells in order, one straight
+        (king-move) leg between each consecutive pair". `algorithm`
+        itself (astar/straight, schema.yaml's own restriction) is
+        deliberately NOT dispatched on here -- both values collapse to
+        the SAME straight-line-leg chaining; a genuine per-leg obstacle-
+        aware policy chain (the real difference astar would make) is out
+        of scope, per the same "it's only a new planner... connect them
+        with straight lines" simplification this method's own name
+        reflects.
+
+        Mechanism: a persistent per-occurrence `idx` fluent (which
+        waypoint is CURRENTLY the active target, 0-based) plus two small
+        static DEFINE arrays (one entry per waypoint, not per grid cell
+        -- nothing like obstacle_clearance's/astar_policy's own grid-
+        wide tables) holding each waypoint's own cell coordinates.
+        target_x/target_y always mirror wp_x/wp_y at the CURRENT idx (a
+        plain lookup, not a case_var -- see below for why that's safe).
+        A dedicated MoveTo_Waypoints_<name> action steps toward the
+        current target exactly like the generic MoveTo, then -- reading
+        its OWN just-staged x,y against the OLD (pre-tick) target --
+        advances idx by one if it just arrived and isn't at the LAST
+        waypoint yet; target_x/target_y are then read back from the
+        (possibly just-advanced) idx, so they always describe whichever
+        waypoint is now active, whether or not idx moved this tick.
+        return_cases only reports success once idx has reached the FINAL
+        waypoint AND the robot is actually there -- an early waypoint's
+        own arrival never returns success, it just quietly retargets.
+        """
+        cells = [(self.config.to_cell(x_m), self.config.to_cell(y_m)) for (x_m, y_m) in waypoints_m]
+        if not cells:
+            raise ValueError('PlanWithWaypoints: waypoints must contain at least one point.')
+        key = '_'.join('{}_{}'.format(cx, cy) for (cx, cy) in cells).replace('-', 'm')
+        plan_name = 'PlanWithWaypoints_{}'.format(key)
+        moveto_name = 'MoveTo_Waypoints_{}'.format(key)
+        if plan_name in self.actions:
+            return plan_name, moveto_name
+
+        last_idx = len(cells) - 1
+        idx_var = 'waypoints_idx_{}'.format(key)
+        wp_x_var = 'waypoints_x_{}'.format(key)
+        wp_y_var = 'waypoints_y_{}'.format(key)
+        self.extra_variables.append(ir.Variable(idx_var, 'bl', 'VAR', '[0, {}]'.format(last_idx), initial='0'))
+        self.extra_variables.append(ir.Variable(
+            wp_x_var, 'bl', 'DEFINE', 'INT', is_array=True, array_size=str(len(cells)), array_default='0',
+            array_assigns=[(str(i), str(cx)) for i, (cx, _cy) in enumerate(cells)], static=True,
+        ))
+        self.extra_variables.append(ir.Variable(
+            wp_y_var, 'bl', 'DEFINE', 'INT', is_array=True, array_size=str(len(cells)), array_default='0',
+            array_assigns=[(str(i), str(cy)) for i, (_cx, cy) in enumerate(cells)], static=True,
+        ))
+
+        gx0, gy0 = cells[0]
+        plan_action = ir.Action(
+            name=plan_name,
+            read_variables=[],
+            write_variables=['target_x', 'target_y', idx_var],
+            updates=[
+                ('var', idx_var, '0'),
+                ('var', 'target_x', str(gx0)),
+                ('var', 'target_y', str(gy0)),
+            ],
+            return_cases=[(None, 'success')],
+        )
+        self.actions[plan_name] = plan_action
+
+        step_x = '(max, -1, (min, 1, (add, (if, (gt, target_x, x), 1, (if, (lt, target_x, x), -1, 0)), noise_x)))'
+        step_y = '(max, -1, (min, 1, (add, (if, (gt, target_y, y), 1, (if, (lt, target_y, y), -1, 0)), noise_y)))'
+        next_x = '(max, MIN_X, (min, MAX_X, (add, x, {step})))'.format(step=step_x)
+        next_y = '(max, MIN_Y, (min, MAX_Y, (add, y, {step})))'.format(step=step_y)
+        is_moving = '(or, (neq, x, prev_x), (neq, y, prev_y))'
+        moving_drain = self._moving_drain_for_hitch() if self.tool_aware else 'MOVING_DRAIN'
+        next_battery = '(max, 0, (sub, battery, (if, {moving}, (add, {drain}, battery_noise), IDLE_DRAIN)))'.format(moving=is_moving, drain=moving_drain)
+        # arrived_not_last: reads x/y AFTER this tick's own step (already
+        # staged above) against target_x/target_y BEFORE this tick's own
+        # retarget below -- exactly the same "old target, new position"
+        # comparison the generic MoveTo's own return_cases use, just
+        # embedded mid-block here because idx's own advance needs it too.
+        arrived_not_last = '(and, (and, (eq, x, target_x), (eq, y, target_y)), (lt, {idx}, {last}))'.format(idx=idx_var, last=last_idx)
+        read_variables = ['x', 'y', 'target_x', 'target_y', 'battery', 'noise_x', 'noise_y', 'battery_noise', idx_var, wp_x_var, wp_y_var]
+        write_variables = ['x', 'y', 'prev_x', 'prev_y', 'battery', idx_var, 'target_x', 'target_y']
+        if self.tool_aware:
+            read_variables += ['hitch', 'deployed']
+        ploughed_vars = [self.ploughed_var(cx, cy) for (cx, cy) in sorted(self.ploughed_cells)]
+        read_variables += ploughed_vars
+        write_variables += ploughed_vars
+        moveto_action = ir.Action(
+            name=moveto_name,
+            read_variables=read_variables,
+            write_variables=write_variables,
+            updates=[
+                ('var', 'prev_x', 'x'),
+                ('var', 'prev_y', 'y'),
+                ('read_env', 'apply_noise', 'True', [
+                    ('x', next_x),
+                    ('y', next_y),
+                    ('battery', next_battery),
+                ]),
+            ] + self._ploughed_updates() + [
+                ('case_var', idx_var, [
+                    (arrived_not_last, ['(add, {}, 1)'.format(idx_var)]),
+                    (None, [idx_var]),
+                ]),
+                ('var', 'target_x', '(index, {}, {})'.format(wp_x_var, idx_var)),
+                ('var', 'target_y', '(index, {}, {})'.format(wp_y_var, idx_var)),
+            ],
+            return_cases=[
+                ('(lte, battery, 0)', 'failure'),
+                ('(and, (eq, {}, {}), (and, (eq, x, target_x), (eq, y, target_y)))'.format(idx_var, last_idx), 'success'),
+                (None, 'running'),
+            ],
+        )
+        self.actions[moveto_name] = moveto_action
+        return plan_name, moveto_name
+
     @staticmethod
     def sample_success_var(sample_id):
         return 'sample_success_{}'.format(sample_id)

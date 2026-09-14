@@ -97,6 +97,18 @@ def _build_non_moveto_leaf(tag, attrib, factory):
         offset = float(attrib['offset']) if 'offset' in attrib else None
         plan_name, moveto_name = factory.make_plan_with(algorithm, goal_x_m, goal_y_m, obstacle_id, offset)
         return 'action', plan_name, moveto_name
+    if tag == 'PlanWithWaypoints':
+        # algorithm must be 'astar'/'straight' (schema.yaml's own
+        # restriction) -- not actually dispatched on, per the Tier 4
+        # simplification (see make_plan_with_waypoints's own docstring),
+        # but still validated so a genuine typo/unsupported value is a
+        # clear translation-time error, not silently ignored.
+        algorithm = attrib['algorithm']
+        if algorithm not in ('astar', 'straight'):
+            raise NotImplementedError("PlanWithWaypoints(algorithm={!r}): only 'astar'/'straight' are valid.".format(algorithm))
+        waypoints_m = [_parse_point(p) for p in attrib['waypoints'].split('|')]
+        plan_name, moveto_name = factory.make_plan_with_waypoints(waypoints_m)
+        return 'action', plan_name, moveto_name
     if tag == 'BatteryOver':
         return 'check', factory.make_battery_over(float(attrib['threshold']))
     if tag == 'BatteryBelow':
@@ -275,14 +287,17 @@ def _walk(element, factory, path):
 
 
 def collect_goal_points_m(xml_path):
-    """All literal `goal="X;Y"` points anywhere in the tree, in metres --
-    used by parse_map.py to make sure the grid covers every planning target,
-    not just the obstacles."""
+    """All literal `goal="X;Y"` points, PLUS every `waypoints="X;Y|X;Y|..."`
+    point (PlanWithWaypoints), anywhere in the tree, in metres -- used by
+    parse_map.py to make sure the grid covers every planning target, not
+    just the obstacles."""
     tree = ET.parse(xml_path)
     points = []
     for element in tree.getroot().iter():
         if 'goal' in element.attrib:
             points.append(_parse_point(element.attrib['goal']))
+        if 'waypoints' in element.attrib:
+            points.extend(_parse_point(p) for p in element.attrib['waypoints'].split('|'))
     return points
 
 
