@@ -160,6 +160,23 @@ class ProblemConfig:
         # so mean/sigma themselves are never read here; every value
         # 0..10 is treated as equally POSSIBLE (nondeterministic choice)
         # regardless of how likely config.yaml's own curve makes it.
+        #
+        # sample.value.discretized: [{value, weight}, ...] -- an EXPLICIT
+        # value list, an alternative to the mean/sigma-implied 0..10
+        # range (see config_to_prolog.py's own sample_value_support/1).
+        # Same "possibility, not probability" treatment as everywhere
+        # else -- weight is never read, only WHICH values are listed
+        # matters (every one becomes a nondeterministic choice outcome).
+        # Falls back to the historical 0..10 range when config.yaml has
+        # no sample.value.discretized section at all (e.g. problem4),
+        # so that translation stays byte-identical for every problem
+        # that predates this feature.
+        sample_cfg = raw.get('sample', {})
+        discretized = sample_cfg.get('value', {}).get('discretized')
+        if discretized:
+            self.sample_value_support = sorted({int(entry['value']) for entry in discretized})
+        else:
+            self.sample_value_support = list(range(11))
 
         # ------------------------------------------------------------
         # Multi-instance tools -- a BT's own <InstallTool tool="..."> /

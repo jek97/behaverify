@@ -1,10 +1,13 @@
 """
 Parses a problem's goal_formula.pl (a single restricted Prolog clause,
-`goal_formula(S) :- Conjunct1, Conjunct2, ... .`, per goal_formula_check.py's
-own "exactly one clause, no disjunction, no local helper predicates"
-limitation -- see vocabulary.yaml's header) and translates it into a
-BehaVerify LTLSPEC code_statement, using vocabulary.yaml's own fluent
-vocabulary as the dispatch table.
+`goal_formula(S) :- Body .`, per goal_formula_check.py's own "exactly one
+clause, no local helper predicates" limitation -- see vocabulary.yaml's
+header) and translates it into a BehaVerify LTLSPEC code_statement, using
+vocabulary.yaml's own fluent vocabulary as the dispatch table. Body may be
+an arbitrary conjunction/disjunction of predicate calls, using plain
+Prolog ','/';' (AND/OR, ',' binding tighter, both right-associative,
+parenthesized grouping allowed) -- see goal_formula_check.py's own commit
+adding inline ';' support, and _parse_disjunction/_parse_conjunction below.
 
 SCOPE: only the fluents actually needed so far are implemented (visited/3,
 and battery_depleted_in/1 built from every MoveTo leaf's own `failure`
@@ -33,7 +36,7 @@ _TOKEN_RE = re.compile(r"""
     \s*(?:
         (?P<comment>%[^\n]*)
       | (?P<clauseop>:-)
-      | (?P<punct>[(),.])
+      | (?P<punct>[(),.;])
       | (?P<number>-?\d+\.\d+|-?\d+)
       | (?P<var>[A-Z_][A-Za-z0-9_]*)
       | (?P<atom>[a-z][A-Za-z0-9_]*)
@@ -84,12 +87,53 @@ def _parse_term(tokens, i):
     raise ValueError('Unexpected token in goal_formula.pl: {}'.format(tokens[i]))
 
 
+def _parse_disjunction(tokens, i):
+    """body ::= conjunction (';' conjunction)* -- ';' (Or) binds LOOSER
+    than ',' (And), matching standard Prolog operator precedence
+    (',' priority 1000, ';' priority 1100 -- lower priority number binds
+    tighter), so "A, B ; C" parses as "(A,B) ; C". Right-associative,
+    same shape problog.logic.Or/And themselves use."""
+    left, i = _parse_conjunction(tokens, i)
+    if i < len(tokens) and tokens[i] == ('punct', ';'):
+        i += 1
+        right, i = _parse_disjunction(tokens, i)
+        return ('or', left, right), i
+    return left, i
+
+
+def _parse_conjunction(tokens, i):
+    left, i = _parse_body_atom(tokens, i)
+    if i < len(tokens) and tokens[i] == ('punct', ','):
+        i += 1
+        right, i = _parse_conjunction(tokens, i)
+        return ('and', left, right), i
+    return left, i
+
+
+def _parse_body_atom(tokens, i):
+    """A single body term -- either a parenthesized sub-formula (grouping,
+    NOT a compound term's own argument list -- that case is already
+    consumed inside _parse_term itself, by the atom-name-then-'(' check),
+    or a plain predicate call."""
+    if tokens[i] == ('punct', '('):
+        i += 1
+        inner, i = _parse_disjunction(tokens, i)
+        if tokens[i] != ('punct', ')'):
+            raise ValueError('Expected ")" closing a grouped goal_formula.pl sub-formula at token {}'.format(i))
+        i += 1
+        return inner, i
+    return _parse_term(tokens, i)
+
+
 def parse_goal_formula(path):
-    """Returns (head_var_name, [body_conjuncts]) -- each conjunct a parsed term."""
+    """Returns (head_var_name, body_tree) -- body_tree is a leaf term
+    ('compound', name, args), or ('and', left, right)/('or', left, right)
+    for a conjunction/disjunction of such trees (see _parse_disjunction/
+    _parse_conjunction for the Prolog ','/';' precedence this follows)."""
     with open(path, 'r', encoding='utf-8') as f:
         text = f.read()
     tokens = _tokenize(text)
-    # goal_formula ( S ) :- Conjunct , Conjunct ... .
+    # goal_formula ( S ) :- Body .
     if tokens[0] != ('atom', 'goal_formula'):
         raise ValueError('goal_formula.pl must define goal_formula/1, found: {}'.format(tokens[0]))
     head, i = _parse_term(tokens, 0)
@@ -99,17 +143,22 @@ def parse_goal_formula(path):
     if tokens[i] != ('clauseop', ':-'):
         raise ValueError('goal_formula.pl must be a rule (":-"), not a fact.')
     i += 1
-    conjuncts = []
-    while True:
-        term, i = _parse_term(tokens, i)
-        conjuncts.append(term)
-        if i < len(tokens) and tokens[i] == ('punct', ','):
-            i += 1
-            continue
-        break
+    body, i = _parse_disjunction(tokens, i)
     if tokens[i] != ('punct', '.'):
         raise ValueError('goal_formula.pl clause must end with "."')
-    return situation_var, conjuncts
+    return situation_var, body
+
+
+def _walk_leaves(body, visit):
+    """Calls visit(term) for every leaf predicate-call term in a body
+    tree returned by parse_goal_formula -- both And and Or branches are
+    walked the same way, since OR doesn't change which leaves exist,
+    only how they're combined (see _parse_disjunction's own note)."""
+    if isinstance(body, tuple) and body[0] in ('and', 'or'):
+        _walk_leaves(body[1], visit)
+        _walk_leaves(body[2], visit)
+    else:
+        visit(body)
 
 
 def _require_point(term):
@@ -331,9 +380,10 @@ def collect_ploughed_cells(path):
     and _translate_ploughed's own note on why this can't be decided
     lazily during translate() the way _DISPATCH normally works).
     """
-    _situation_var, conjuncts = parse_goal_formula(path)
+    _situation_var, body = parse_goal_formula(path)
     cells = set()
-    for term in conjuncts:
+
+    def visit(term):
         if term[0] == 'compound' and term[1] == 'ploughed' and len(term[2]) == 3:
             cx_term, cy_term, _s = term[2]
             if cx_term[0] != 'num' or cy_term[0] != 'num':
@@ -341,29 +391,36 @@ def collect_ploughed_cells(path):
                     "ploughed/3's Cx,Cy must be literal integers (this translator's own grid-cell units)."
                 )
             cells.add((int(cx_term[1]), int(cy_term[1])))
+
+    _walk_leaves(body, visit)
     return cells
 
 
+def _translate_body(body, config, factory, situation_var, bound):
+    if isinstance(body, tuple) and body[0] in ('and', 'or'):
+        left = _translate_body(body[1], config, factory, situation_var, bound)
+        right = _translate_body(body[2], config, factory, situation_var, bound)
+        return '({}, {}, {})'.format(body[0], left, right)
+    term = body
+    if term[0] != 'compound':
+        raise NotImplementedError('goal_formula.pl conjunct must be a predicate call, found: {}'.format(term))
+    key = (term[1], len(term[2]))
+    if key not in _DISPATCH:
+        raise NotImplementedError(
+            'goal_formula.pl uses {}/{}, which this translator does not yet support -- '
+            'add a case to translator/goal_formula.py\'s _DISPATCH table.'.format(*key)
+        )
+    return _DISPATCH[key](term[2], config, factory, situation_var, bound)
+
+
 def translate(path, config, factory, bound=None):
-    """Returns a single code_statement string: the AND of every conjunct's
-    own translation. Raises NotImplementedError for any conjunct whose
-    predicate/arity isn't in _DISPATCH yet. `bound`, if given, makes every
-    `finally` a bounded `finally_bounded [0,bound]` instead -- see
-    _wrap_finally's own docstring for why that matters for nuXmv's
-    verification cost, not just generation."""
-    situation_var, conjuncts = parse_goal_formula(path)
-    pieces = []
-    for term in conjuncts:
-        if term[0] != 'compound':
-            raise NotImplementedError('goal_formula.pl conjunct must be a predicate call, found: {}'.format(term))
-        key = (term[1], len(term[2]))
-        if key not in _DISPATCH:
-            raise NotImplementedError(
-                'goal_formula.pl uses {}/{}, which this translator does not yet support -- '
-                'add a case to translator/goal_formula.py\'s _DISPATCH table.'.format(*key)
-            )
-        pieces.append(_DISPATCH[key](term[2], config, factory, situation_var, bound))
-    formula = pieces[0]
-    for extra in pieces[1:]:
-        formula = '(and, {}, {})'.format(formula, extra)
-    return formula
+    """Returns a single code_statement string translating the WHOLE
+    goal_formula.pl body -- an AND/OR tree of predicate calls (see
+    parse_goal_formula/_parse_disjunction for the ','/';' precedence).
+    Raises NotImplementedError for any leaf whose predicate/arity isn't
+    in _DISPATCH yet. `bound`, if given, makes every `finally` a bounded
+    `finally_bounded [0,bound]` instead -- see _wrap_finally's own
+    docstring for why that matters for nuXmv's verification cost, not
+    just generation."""
+    situation_var, body = parse_goal_formula(path)
+    return _translate_body(body, config, factory, situation_var, bound)

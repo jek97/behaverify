@@ -35,7 +35,7 @@ sibling selected" and hands it to the next MoveTo leaf it encounters.
 """
 import xml.etree.ElementTree as ET
 
-from . import ir
+from . import geometry, ir
 
 _COMPOSITE_TAGS = {
     # 'with_true_memory' exists in the grammar but is NOT implemented by this
@@ -120,6 +120,17 @@ def _build_non_moveto_leaf(tag, attrib, factory):
         return 'check', factory.make_line_of_sight_clear()
     if tag == 'HaltedWith':
         return 'check', factory.make_halted_with()
+    if tag == 'Hitched':
+        return 'check', factory.make_hitched(attrib.get('kind'))
+    if tag == 'Deployed':
+        return 'check', factory.make_deployed()
+    if tag == 'PloughedAt':
+        gx, gy = _parse_point(attrib['goal'])
+        return 'check', factory.make_ploughed_at(gx, gy)
+    if tag == 'PloughedBetween':
+        p1x, p1y = _parse_point(attrib['p1'])
+        p2x, p2y = _parse_point(attrib['p2'])
+        return 'check', factory.make_ploughed_between(p1x, p1y, p2x, p2y)
     if tag == 'TakeSample':
         return 'action', factory.make_take_sample(attrib['id'])
     if tag == 'SampleValueBelow':
@@ -304,6 +315,34 @@ def collect_tool_instance_ids(xml_path):
     """
     tree = ET.parse(xml_path)
     return {el.attrib['tool'] for el in tree.getroot().iter() if el.tag in _TOOL_ACTION_TAGS}
+
+
+def collect_ploughed_cells_from_tree(xml_path, config):
+    """
+    Every (Cx,Cy) grid cell a PloughedAt/PloughedBetween node anywhere in
+    behavior_tree.xml references, in THIS translator's own grid-cell
+    units (config.to_cell) -- the BT-XML sibling of goal_formula.
+    collect_ploughed_cells (which only scans goal_formula.pl's own
+    ploughed/3 conjuncts, in already-cell-unit integers). Both feed the
+    SAME factory.ploughed_cells set (see translator/main.py), since
+    PloughedAt/PloughedBetween read the exact same ploughed_<cx>_<cy>
+    fluents ploughed/3 does (leaf_library.py's make_ploughed_at/
+    make_ploughed_between) -- called BEFORE shared_variables()/
+    parse_tree(), same reason every other pre-pass in this module is.
+    """
+    tree = ET.parse(xml_path)
+    cells = set()
+    for element in tree.getroot().iter():
+        if element.tag == 'PloughedAt':
+            gx, gy = _parse_point(element.attrib['goal'])
+            cells.add((config.to_cell(gx), config.to_cell(gy)))
+        elif element.tag == 'PloughedBetween':
+            p1x, p1y = _parse_point(element.attrib['p1'])
+            p2x, p2y = _parse_point(element.attrib['p2'])
+            cx1, cy1 = config.to_cell(p1x), config.to_cell(p1y)
+            cx2, cy2 = config.to_cell(p2x), config.to_cell(p2y)
+            cells.update(geometry.bresenham_cells(cx1, cy1, cx2, cy2))
+    return cells
 
 
 def collect_move_to_aliases(tree_node):

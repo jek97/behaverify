@@ -77,8 +77,27 @@ sound 1:1 translation the source ProbLog system's own bt_to_prolog.py
 uses (see parse_behavior_tree.py's _UNROLL_TAGS for why this isn't an
 approximation, and why BehaVerify's own built-in `repeat` decorator means
 something different and can't be reused for this).
+
+TIER 1 ADDITIONS (schema.yaml, `merged-moveto` branch): Hitched/Deployed/
+PloughedAt/PloughedBetween conditions ARE implemented (make_hitched/
+make_deployed/make_ploughed_at/make_ploughed_between below) -- PloughedAt/
+PloughedBetween discretize their own Point port(s) through THIS
+translator's own grid spacing (config.to_cell), not schema.yaml's
+separate ploughing.cell_size, per the same "reuse the grid this project
+already works in" simplification goal_formula.py's own ploughed/3
+translation already uses; PloughedBetween's "every cell along the line"
+check reuses geometry.bresenham_cells. PlanWith(algorithm=dastar) IS
+implemented too, aliased directly to make_plan_astar (see make_plan_with)
+-- dastar's own `step` port (an arc-length resampling distance for a
+smooth spline that doesn't exist on this discrete grid in the first
+place) has nothing left to distinguish it from plain astar here, so it's
+accepted-and-ignored. sample.value.discretized (an explicit value list,
+alternative to the historical hardcoded 0..10 range) IS read, in
+ProblemConfig.sample_value_support, and make_take_sample now draws from
+that instead of a literal range(11). `;` (OR) in goal_formula.pl IS
+supported (see goal_formula.py's own _parse_disjunction).
 """
-from . import astar_policy, ir
+from . import astar_policy, geometry, ir
 
 
 def squared_distance_condition(x_name, y_name, gx, gy, threshold_cells, op):
@@ -414,6 +433,20 @@ class LeafFactory:
             return self.make_plan_straight(goal_x_m, goal_y_m), self.make_move_to()
         if algorithm == 'astar':
             return self.make_plan_astar(goal_x_m, goal_y_m)
+        if algorithm == 'dastar':
+            # dastar (schema.yaml's own "discretized A*"): runs the SAME
+            # raw A* search as astar, then resamples the result by arc
+            # length and re-chains it into straight-line legs. On THIS
+            # translator's own grid, `astar` already IS a per-cell
+            # policy of straight (king-move) steps toward the goal, one
+            # cell at a time -- there is no smooth spline being
+            # discretized away in the first place, so dastar's own
+            # `step` port (a continuous-domain resampling distance) has
+            # nothing left to distinguish it from plain astar here.
+            # Deliberately aliased, not reimplemented: same MoveTo_Astar_
+            # <goal> action pair, `step` accepted-and-ignored (see
+            # parse_behavior_tree.py's PlanWith dispatch).
+            return self.make_plan_astar(goal_x_m, goal_y_m)
         if algorithm == 'voronoi':
             return self.make_plan_voronoi(goal_x_m, goal_y_m)
         if algorithm == 'follow_boarder':
@@ -623,7 +656,7 @@ class LeafFactory:
                 # value from an EARLIER success can never be misread
                 # after a later failure.
                 ('case_var', value_var, [
-                    (success_var, [str(v) for v in range(11)]),
+                    (success_var, [str(v) for v in self.config.sample_value_support]),
                     (None, [value_var]),
                 ]),
                 ('case_var', pos_x_var, [(success_var, ['x']), (None, [pos_x_var])]),
@@ -636,7 +669,9 @@ class LeafFactory:
         )
         self.actions[name] = action
         self.extra_variables.append(ir.Variable(success_var, 'bl', 'VAR', 'BOOLEAN', initial='False'))
-        self.extra_variables.append(ir.Variable(value_var, 'bl', 'VAR', '[0, 10]', initial='0'))
+        support = self.config.sample_value_support
+        value_domain = '[0, 10]' if support == list(range(11)) else '{' + ', '.join(str(v) for v in support) + '}'
+        self.extra_variables.append(ir.Variable(value_var, 'bl', 'VAR', value_domain, initial=str(support[0])))
         self.extra_variables.append(ir.Variable(pos_x_var, 'bl', 'VAR', '[MIN_X, MAX_X]', initial=_fmt(sx)))
         self.extra_variables.append(ir.Variable(pos_y_var, 'bl', 'VAR', '[MIN_Y, MAX_Y]', initial=_fmt(sy)))
         return name
@@ -962,6 +997,84 @@ class LeafFactory:
         value_var = self.sample_value_var(sample_id)
         condition = '(and, {}, ({}, {}, {}))'.format(success_var, op, value_var, threshold_int)
         self.checks[name] = ir.Check(name, [success_var, value_var], condition)
+        return name
+
+    def make_hitched(self, kind=None):
+        """
+        holds(hitched,S)/holds(hitched(Kind),S) -- True iff `hitch` != free
+        (kind omitted), or specifically `hitch` == kind (kind given).
+        Only meaningful once tool_aware (see shared_variables) -- a tree
+        that reaches this leaf necessarily also uses InstallTool/
+        UninstallTool/DeployTool/RetractTool somewhere, or the `hitch`
+        fluent wouldn't exist at all, so parse_behavior_tree.py's own
+        uses_tool_actions pre-pass already guarantees tool_aware is set
+        by the time factory.shared_variables() runs.
+        """
+        if kind is None:
+            name = 'Hitched'
+            condition = "(neq, hitch, 'free')"
+        else:
+            if kind not in ('cart', 'plow'):
+                raise NotImplementedError("Hitched(kind={!r}): only 'cart'/'plow' are supported.".format(kind))
+            name = 'Hitched_{}'.format(kind)
+            condition = "(eq, hitch, '{}')".format(kind)
+        if name in self.checks:
+            return name
+        self.checks[name] = ir.Check(name, ['hitch'], condition)
+        return name
+
+    def make_deployed(self):
+        """holds(deployed,S) -- a thin wrapper around the shared `deployed` fluent."""
+        name = 'Deployed'
+        if name in self.checks:
+            return name
+        self.checks[name] = ir.Check(name, ['deployed'], '(eq, deployed, True)')
+        return name
+
+    def make_ploughed_at(self, goal_x_m, goal_y_m):
+        """
+        holds(ploughed_at(GX,GY),S) -- discretizes `goal` (metres) to a
+        cell via THIS translator's own grid spacing (config.to_cell,
+        disc_step_position) -- per the approved simplification: reuse
+        the grid this project already works in rather than introduce a
+        second, independent ploughing.cell_size grid (see goal_formula.
+        py's own _translate_ploughed note on the same choice for
+        ploughed/3's own Cx,Cy). Reads the SAME ploughed_<cx>_<cy>
+        fluent ploughed/3 does -- the cell must already be registered in
+        factory.ploughed_cells (see parse_behavior_tree.collect_
+        ploughed_cells_from_tree, called before shared_variables()).
+        """
+        cx, cy = self.config.to_cell(goal_x_m), self.config.to_cell(goal_y_m)
+        name = 'PloughedAt_{}_{}'.format(cx, cy).replace('-', 'm')
+        if name in self.checks:
+            return name
+        var_name = self.ploughed_var(cx, cy)
+        self.checks[name] = ir.Check(name, [var_name], '(eq, {}, True)'.format(var_name))
+        return name
+
+    def make_ploughed_between(self, p1_x_m, p1_y_m, p2_x_m, p2_y_m):
+        """
+        holds(ploughed_between(X1,Y1,X2,Y2),S) -- True iff EVERY cell
+        along the (integer Bresenham) line between p1's and p2's own
+        cells is already ploughed -- see geometry.bresenham_cells (the
+        same primitive ObstacleOnPath's own module docstring already
+        names as reusable for exactly this kind of multi-cell line
+        check). Every cell along the line must already be registered in
+        factory.ploughed_cells (see parse_behavior_tree.collect_
+        ploughed_cells_from_tree).
+        """
+        cx1, cy1 = self.config.to_cell(p1_x_m), self.config.to_cell(p1_y_m)
+        cx2, cy2 = self.config.to_cell(p2_x_m), self.config.to_cell(p2_y_m)
+        name = 'PloughedBetween_{}_{}_{}_{}'.format(cx1, cy1, cx2, cy2).replace('-', 'm')
+        if name in self.checks:
+            return name
+        cells = geometry.bresenham_cells(cx1, cy1, cx2, cy2)
+        var_names = [self.ploughed_var(cx, cy) for (cx, cy) in cells]
+        clauses = ['(eq, {}, True)'.format(v) for v in var_names]
+        condition = clauses[0]
+        for extra in clauses[1:]:
+            condition = '(and, {}, {})'.format(condition, extra)
+        self.checks[name] = ir.Check(name, var_names, condition)
         return name
 
     def make_obstacle_in_bound(self, threshold_m):

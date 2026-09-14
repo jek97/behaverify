@@ -30,6 +30,7 @@ def translate_problem(problem_dir, spec_type='LTLSPEC', bound=None):
     # this can't be decided lazily once an InstallTool/UninstallTool tag
     # is actually encountered during the tree walk.
     factory.ploughed_cells = goal_formula.collect_ploughed_cells(os.path.join(problem_dir, 'goal_formula.pl'))
+    factory.ploughed_cells |= parse_behavior_tree.collect_ploughed_cells_from_tree(xml_path, config)
     # ploughed/3 inherently needs `hitch` (it only ever fires while
     # hitch=='plow') -- force hitch-awareness even for the (unusual, but
     # not invalid) case of a goal formula mentioning ploughed/3 without
